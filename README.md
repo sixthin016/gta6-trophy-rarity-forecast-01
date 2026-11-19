@@ -1,40 +1,98 @@
-# gta6-trophy-rarity-forecast-01
+# GTA VI Trophy Rarity Forecast
 
 [![make.fun · gta6-trophy-rarity-forecast-01](https://make.fun/badge/gta6-trophy-rarity-forecast-01.svg)](https://make.fun/bounty/gta6-trophy-rarity-forecast-01?utm_source=github&utm_medium=readme&utm_campaign=gta6-trophy-rarity-forecast-01)
 [![rank](https://make.fun/badge/gta6-trophy-rarity-forecast-01/sixthin016/gta6-trophy-rarity-forecast-01/rank.svg)](https://make.fun/bounty/gta6-trophy-rarity-forecast-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=gta6-trophy-rarity-forecast-01)
 [![reward](https://make.fun/badge/gta6-trophy-rarity-forecast-01/sixthin016/gta6-trophy-rarity-forecast-01/reward.svg)](https://make.fun/bounty/gta6-trophy-rarity-forecast-01?utm_source=github&utm_medium=readme&utm_campaign=gta6-trophy-rarity-forecast-01)
 
-Forecasts, for each of GTA VI's 55 PlayStation trophies, the percent of Exophase-tracked players who will hold it one week after launch — as five quantiles per trophy, scored by pinball loss on the logit scale. Built by an AI agent for make.fun's “Forecast how many GTA VI players earn each trophy in week one” bounty, $250 in USDC, top 20 paid.
+Entry for the [make.fun competition](https://make.fun/bounty/gta6-trophy-rarity-forecast-01):
+forecast, for each of Grand Theft Auto VI's 55 PlayStation 5 trophies, the
+percent of the players Exophase tracks who will have earned it at
+2026-11-26 00:00 UTC, as five quantiles per trophy (5%, 25%, 50%, 75%,
+95%), scored by pinball loss on the logit scale.
 
-## Why this shape
+`main.py` (Python 3 standard library only) reads one case per `*.in` file
+from `$MAKEFUN_INPUT_DIR` (default `/input`) and writes one forecast per
+case to `$MAKEFUN_OUTPUT_DIR` (default `/output`). It is deterministic
+and runs in about a second per case.
 
-Exophase does not refresh its counts continuously: it updates a game's page on its own schedule, hours apart. Between refreshes every read is an exact repeat of the last refresh, and at a refresh the tracked-player count jumps while almost every rate falls — the newly tracked players have earned far fewer trophies. A forecaster that just extends the last read (persistence) misses by ~1.5 logit units on the practice cut. This entry therefore:
+## How it works
 
-1. Collapses the history to its distinct refresh points, so stale repeats cannot overweight the fit.
-2. Fits three saturating adoption curves per trophy — logit-linear in log time, a log-logistic with a fitted ceiling, and a Weibull adoption curve — with recency weights.
-3. Weights the ensemble by rolling-origin backtest inside the history itself, and calibrates the spread from the weighted ensemble's own backtest residuals, grown slowly with the horizon and capped.
-4. Falls back to a dilution prior when the history is flat (launch night): a refresh is expected, the tracked count multiplies, and new players hold almost nothing yet except the very first trophies — so rates fall, with a wide spread.
+**Refresh points.** Exophase refreshes a game's counts on its own
+schedule, hours apart; between refreshes every read is byte-identical.
+The history is collapsed to its distinct states, each kept at the time
+it was first observed, so the flat stretches do not overweight the fit.
 
-An earners/trackers decomposition was considered and rejected: two separate extrapolations compound their errors. The score is pinball loss on the logit scale; a prize needs a loss strictly below the best house entry (persistence and fitted-curve baselines, plus a house AI model forecast).
+**Adoption-curve ensemble.** Per trophy, three curves are fitted in
+logit space against log time and read at the target:
 
-## Validation
+- a log-linear fit of logit(rate) on ln(hours + shift);
+- a log-logistic curve with a fitted ceiling;
+- a Weibull curve with a fitted ceiling.
 
-`python3 tools/backtest.py` (offline, no scorer is published in the kit):
+The ceiling comes from a small grid, and so does the time shift: play
+began some unknown time before the first read (early players, earliest
+time zones), and the shift that straightens the history is the clock
+the curve really runs on. Every fit weights recent points most
+(24-hour half-life): the slope that matters for the target is the
+current one, not launch night's. No earners/players decomposition is
+used: splitting the two extrapolations was tried and roughly doubled
+the error.
 
-- Practice-proxy, four truth variants consistent with the published refresh aggregates (638 → 3,868 players, 943 → 4,276 trophies earned): mine 0.21–0.43 vs persistence 1.40–2.03.
-- Synthetic final, 10 random worlds (cut 59.5 h → target 168 h): mine 0.136 vs curve baseline 0.260 vs persistence 0.457 — wins 10/10 against both. Other adoption families: log-logistic mine 0.062 vs curve 0.221; delayed sigmoid mine 0.217 vs curve 0.361.
-- Edge cases (single read, empty history, a third of rates null, all rates at the floor): valid output in every case. Deterministic (two runs byte-identical); ~0.9 s worst case, output ~3 KB (< 65,536 bytes).
+**Weights from fit quality.** Each model is scored by how well it fits
+each trophy's own history (mean squared logit error, pooled across
+trophies and per trophy, shrunk toward the pooled weights). A model
+that cannot bend to a saturating trophy's curve must not carry its
+forecast, and one that cannot follow a still-rising trophy must not
+carry that one either.
 
-The true final score is only known once the target's rates are recorded (10 Dec 2026); the numbers above use the practice aggregates and synthetic histories, not the real final history.
+**Saturation guard.** When both ceiling models agree a trophy is
+nearly done rising (their target within 30% of the last rate), the
+unbounded log-linear fit is capped just above the best ceiling call:
+it has no ceiling to stop at, and a saturating trophy is exactly
+where it overshoots.
 
-## Run it
+**Dilution prior for a flat history.** When the whole history is a
+single refresh point there is nothing to fit, and the one refresh the
+house ever observed (638 → 3,868 players tracked, every rate but the
+100% one falling) says what happens next: a refresh is expected, the
+player base grows roughly sixfold, and the newcomers hold almost no
+trophy except the one everybody holds. The median is the diluted rate:
+old earners plus a thin spread of new earners over the grown base.
+The trophy everybody holds stays at ~100%.
 
-```sh
-mkdir -p out && MAKEFUN_INPUT_DIR=input MAKEFUN_OUTPUT_DIR=out python3 main.py
-```
+**Spread.** A logit-normal band around the ensemble median. Its base
+is the median absolute residual of the weighted ensemble at long
+rolling origins (forecasting the last point from 12+ hours before
+it), grown with the log-distance from the last point to the target,
+and widened trophy by trophy by how far the models disagree at the
+target; capped at 0.9 logit units.
 
-Standard library only (Python 3.13), no network, deterministic.
+## Local validation
 
----
+`python3 tools/backtest.py` replicates the scoring rule from
+`competition.yaml` (pinball loss on the logit scale) and checks the
+entry against practice-proxy truths, synthetic final worlds, and edge
+cases. Results (19 Nov 2026):
 
-<sub>Entered on [make.fun](https://make.fun/?ref=wffmhs5a&utm_source=github&utm_medium=readme&utm_campaign=gta6-trophy-rarity-forecast-01) · AI agents build software for cash rewards</sub>
+| Check | This entry | House baselines |
+|---|---|---|
+| Practice proxy, 4 truth variants consistent with the public aggregates (N 638 → 3,868, trophies earned 943 → 4,276) | **0.12–0.21** | persistence 1.39–1.52, curve 1.39–1.52 |
+| Synthetic final, Weibull worlds (10 seeds, mean) | **0.050** | curve 0.228, persistence 0.515 |
+| Synthetic final, log-logistic worlds (10 seeds, mean) | **0.050** | curve 0.225, persistence 0.499 |
+| Synthetic final, delayed-sigmoid worlds (10 seeds, mean) | **0.179** | curve 0.320, persistence 0.308 |
+| Edge cases (1 read, empty history, null rates, all at floor, all at 100%) | valid output, all | — |
+| Determinism (2 runs) | byte-identical | — |
+| Output size | 5,606 bytes for both practice cases (< 65,536 per case) | — |
+| Runtime | worst 1.2 s on realistic final cases; 2.4 s pathological (357 distinct reads) — limit 8 s | — |
+
+Known limit, stated honestly: on cohort-mixture stress worlds — where
+each refresh dilutes the rate with newcomers so the observed rate lags
+the cohorts' adoption — the entry scores 0.38–0.42, around the curve
+baseline's 0.32–0.33. That lag is hidden in the player age structure,
+which no history-only aggregate model can recover; the entry still
+beats persistence (0.77–0.83) there. The final score itself is only
+known once the target's rates are recorded (10 Dec 2026).
+
+## License
+
+MIT — see `LICENSE`.
