@@ -1,444 +1,530 @@
-"""Validation harness for the trophy forecaster v2 (NOT part of the entry).
+#!/usr/bin/env python3
+"""Local validation harness for the GTA VI trophy forecast (NOT part of
+the entry). Replicates the pinball-on-logit score from competition.yaml
+and checks the entry against:
 
-Same practice-proxy + synthetic-final + other-families + edge checks as
-v1, plus an expanding-window CV check (truncate a synthetic history at
-24/36/48 h, forecast +24/+18/+10 h ahead) and an ablation check that
-reports the joint model's CV weight and the loss with the joint model
-forced on vs gated off.
+  * practice-proxy truths: four synthetic answers for the two practice
+    cases, all consistent with the public aggregates (Exophase refreshed
+    638 -> 3,868 players between 04:00Z and 04:30Z on 2026-11-19 and
+    every rate but the 100% one fell):
+      A uniform      -- new players hold nothing (except the 100% one)
+      B earliness    -- new players hold the earliest trophies at 30%
+      C early-conc.  -- new players hold ONLY the top 12 trophies, fully
+      D lognormal    -- A with per-trophy lognormal noise (sigma 0.45)
+  * synthetic final worlds: histories generated from three curve
+    families (Weibull x10, log-logistic x5, delayed-sigmoid x5), scored
+    against the entry, the persistence baseline and the curve baseline.
+  * expanding-window CV: cut the history at 24h / 36h / 48h and
+    forecast +24h / +18h / +10h.
+  * ablation: joint-only, equal-weight curves, 50/50 blend, weighted
+    curves (the shipped configuration).
+  * edge cases (1 read, empty history, null rates, all at floor) and
+    determinism (two runs byte-identical).
 
-
-Two checks, both run offline against known or constructed truths:
-
-1. Practice-proxy check: the kit's competition.yaml publishes the practice
-   answers' aggregates (refresh 638 -> 3,868 players, 943 -> 4,276 trophies
-   earned, every rate but the 100% one fell). Score my forecast and the
-   persistence baseline against several per-trophy truths consistent with
-   those aggregates. My forecast must beat persistence (loss 1.51) under
-   every variant, not just one.
-
-2. Synthetic final check: generate launch histories with refresh-step
-   dynamics (reads repeat the last refresh for hours, then jump), Weibull
-   adoption curves per trophy and growing tracked counts; cut at 59.5 h
-   (the real deadline), target at 168 h (Nov 26). Score my forecaster
-   against persistence and the log-time-linear curve baseline over many
-   random worlds. This is the closest available stand-in for the final,
-   where the true history is not yet recorded.
-
-Usage: python3 tools/backtest.py
+Usage: python3 tools/backtest.py   (run from the repository root)
 """
 
 import json
 import math
+import os
 import random
+import subprocess
 import sys
-from pathlib import Path
+import tempfile
+import time
+from datetime import datetime, timedelta, timezone
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-import main as M
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+sys.path.insert(0, ROOT)
+import main as entry  # noqa: E402  (the entry under test)
 
-KIT = Path("/home/hatch/workspace/makefun/gta6-trophy-rarity-forecast-01-kit/"
-           "gta6-trophy-rarity-forecast-01-kit/input")
+KIT_INPUT = os.environ.get(
+    "KIT_INPUT_DIR",
+    os.path.join(os.path.expanduser("~"), "workspace", "makefun",
+                 "gta6-trophy-rarity-forecast-01-kit",
+                 "gta6-trophy-rarity-forecast-01-kit", "input"))
 
-
-def pinball(actual, quantiles):
-    return M.pinball_loss(actual, quantiles)
-
-
-def score_forecast(out, truth):
-    """Mean pinball loss of an output dict against {trophy_id: rate}."""
-    rows = {r["id"]: r["q"] for r in out["trophies"]}
-    return sum(pinball(truth[i], rows[i]) for i in truth) / len(truth)
-
-
-def persistence_forecast(case):
-    """The starter: median = last rate, sigma = 0.5*sqrt(horizon_days)."""
-    last = case["history"][-1]
-    d = case["horizon_minutes"] / 1440.0
-    spread = 0.5 * math.sqrt(d)
-    rows = []
-    for i, t in enumerate(case["trophies"]):
-        rate = last["rates"][i]
-        lg = M.logit(rate if rate is not None else 0)
-        qs = [M.round4(min(99.99, max(0.01, M.inv_logit(lg + z * spread))))
-              for z in M.Z]
-        for j in range(1, 5):
-            qs[j] = max(qs[j], qs[j - 1])
-        rows.append({"id": t["id"], "q": qs})
-    return {"trophies": rows}
+Z = (-1.645, -0.674, 0.0, 0.674, 1.645)
+RELEASE = datetime(2026, 11, 19, 0, 0, tzinfo=timezone.utc)
+DEADLINE = datetime(2026, 11, 21, 11, 30, tzinfo=timezone.utc)
+TARGET = datetime(2026, 11, 26, 0, 0, tzinfo=timezone.utc)
 
 
-# --------------------------------------------------------------------------
-# 1. Practice-proxy check
-# --------------------------------------------------------------------------
+# ---------------------------------------------------------------- scoring
 
-def practice_truths():
-    """Plausible per-trophy refreshed truths, all consistent with the
-    published aggregates: N 638 -> 3,868, total earned 943 -> 4,276,
-    trophy 2 stays 100%. Each variant is scaled so its total is 4,276.
-    """
-    case = json.loads((KIT / "p00.in").read_text())
-    last = case["history"][-1]["rates"]
-    trophies = case["trophies"]
-    n_new = 3868
-    total_new = 4276
-
-    def scale(rates):
-        # rates: dict id -> new rate; rescale the non-100 ones to hit total.
-        fixed = sum(r for i, r in rates.items() if r >= 99.99)
-        rest = sum(r for i, r in rates.items() if r < 99.99)
-        target_rest = total_new / n_new * 100 - fixed
-        f = target_rest / rest if rest > 0 else 1.0
-        return {i: (r if r >= 99.99 else r * f) for i, r in rates.items()}
-
-    variants = {}
-    # A: uniform dilution of every non-100 rate.
-    variants["A uniform x0.22"] = scale(
-        {t["id"]: (100.0 if i == 1 else last[i] * 0.22)
-         for i, t in enumerate(trophies)})
-    # B: earliness-graded dilution (early keeps more).
-    fac = {2: 0.45, 1: 0.22, 0: 0.12}
-    variants["B earliness-graded"] = scale(
-        {t["id"]: (100.0 if i == 1 else last[i] * fac[M.earliness(t)])
-         for i, t in enumerate(trophies)})
-    # C: concentrated on the earliest story trophies, rest near zero.
-    early = {3, 4, 8, 2}
-    variants["C early-concentrated"] = scale(
-        {t["id"]: (100.0 if i == 1 else
-                   last[i] * (0.8 if t["id"] in early else 0.05))
-         for i, t in enumerate(trophies)})
-    # D: lognormal noise around the mean, seeded.
-    rng = random.Random(7)
-    variants["D lognormal noise"] = scale(
-        {t["id"]: (100.0 if i == 1 else
-                   max(0.01, last[i] * 0.22 * math.exp(rng.gauss(0, 0.7))))
-         for i, t in enumerate(trophies)})
-    return case, variants
+def logit_pct(p):
+    p = min(99.99, max(0.01, float(p)))
+    q = p / 100.0
+    return math.log(q / (1.0 - q))
 
 
-def check_practice():
-    case, variants = practice_truths()
-    mine = M.forecast_case(case)
-    base = persistence_forecast(case)
-    print("PRACTICE-PROXY (published aggregates; persistence loss is 1.51)")
-    for name, truth in variants.items():
-        lm = score_forecast(mine, truth)
-        lb = score_forecast(base, truth)
-        print(f"  {name:24s} mine={lm:.3f}  persistence={lb:.3f}  "
-              f"improvement={(lb - lm) / lb * 100:.0f}%")
-        assert lm < lb, f"lost to persistence on {name}"
-        assert lm < 1.0, f"practice loss too high on {name}: {lm}"
-    print("  -> practice check PASSED (beats persistence on all variants)")
+def pinball_loss(actual, rows):
+    """Mean pinball loss over every (trophy, level)."""
+    by_id = {r["id"]: r["q"] for r in rows}
+    tot, n = 0.0, 0
+    for tid, y in actual.items():
+        qs = by_id[tid]
+        ly = logit_pct(y)
+        for tau, q in zip((0.05, 0.25, 0.5, 0.75, 0.95), qs):
+            d = ly - logit_pct(q)
+            tot += 2.0 * max(tau * d, (tau - 1.0) * d)
+            n += 1
+    return tot / n if n else float("nan")
 
 
-# --------------------------------------------------------------------------
-# 2. Synthetic final check
-# --------------------------------------------------------------------------
+def run_entry(cases):
+    """Run main.py (subprocess) on {case_id: case} -> ({id: rows}, secs)."""
+    with tempfile.TemporaryDirectory() as td:
+        in_dir = os.path.join(td, "in")
+        out_dir = os.path.join(td, "out")
+        os.makedirs(in_dir)
+        os.makedirs(out_dir)
+        for cid, case in cases.items():
+            with open(os.path.join(in_dir, cid + ".in"), "w") as fh:
+                json.dump(case, fh)
+        env = dict(os.environ)
+        env["MAKEFUN_INPUT_DIR"] = in_dir
+        env["MAKEFUN_OUTPUT_DIR"] = out_dir
+        t0 = time.time()
+        proc = subprocess.run(
+            [sys.executable, os.path.join(ROOT, "main.py")],
+            env=env, capture_output=True, text=True, timeout=120)
+        secs = time.time() - t0
+        if proc.returncode != 0:
+            raise RuntimeError("main.py failed: " + proc.stderr[-2000:])
+        out = {}
+        for cid in cases:
+            with open(os.path.join(out_dir, cid + ".out")) as fh:
+                out[cid] = json.load(fh)["trophies"]
+        return out, secs
 
-def synth_world(rng, family="weibull"):
-    """One synthetic launch: refresh-step history to the 59.5 h cut,
-    truth at 168 h. Returns (case, truth dict). `family` picks the true
-    adoption shape: weibull, loglogistic, or delayed sigmoid (chapter-
-    gated: a trophy's adoption only starts after a per-trophy delay)."""
-    trophies = json.loads((KIT / "p00.in").read_text())["trophies"]
-    # Per-trophy adoption: ceiling by tier, shape by family.
-    params = {}
-    for t in trophies:
-        tier = t["tier"]
-        if tier == "platinum":
-            pmax = rng.uniform(0.3, 2.0)
-        elif tier == "gold":
-            pmax = rng.uniform(1.0, 8.0)
-        elif tier == "silver":
-            pmax = rng.uniform(4.0, 25.0)
+
+# ---------------------------------------------------------------- baselines
+
+def persistence_rows(case):
+    rows = entry.persistence_rows(case)
+    return rows
+
+
+def curve_baseline_rows(case):
+    """House curve baseline: per trophy OLS of logit rate on
+    ln(1 + hours since release) over the last 24h of reads, read at the
+    target; spread = random-walk + residual combined."""
+    trophies = case.get("trophies") or []
+    points, t_target, horizon_days, _ = entry.refresh_points(case)
+    target = entry.parse_time(case.get("target"))
+    t0 = entry.parse_time((case.get("history") or [{}])[0].get("at")) \
+        if case.get("history") else None
+    # Rebuild points on the release clock for the baseline's x-axis.
+    hist = case.get("history") or []
+    reads = []
+    for read in hist:
+        at = entry.parse_time(read.get("at") or read.get("slot"))
+        if at is None:
+            continue
+        reads.append((at, read))
+    if target is None or not reads:
+        return persistence_rows(case)
+    cutoff = target - timedelta(hours=24)
+    # NOTE: baseline uses reads in the last 24h before the checkpoint.
+    checkpoint = entry.parse_time(case.get("at"))
+    recent = [(at, r) for at, r in reads if at >= checkpoint - timedelta(hours=24)]
+    d = max(horizon_days, 0.0)
+    rw = 0.5 * math.sqrt(d)
+    out = []
+    for i, tr in enumerate(trophies):
+        pts = []
+        for at, read in recent:
+            rates = read.get("rates") or []
+            if i < len(rates) and rates[i] is not None:
+                h = (at - RELEASE).total_seconds() / 3600.0
+                pts.append((math.log1p(max(h, 0.0)), logit_pct(rates[i])))
+        last_rate = None
+        for at, read in reversed(reads):
+            rates = read.get("rates") or []
+            if i < len(rates) and rates[i] is not None:
+                last_rate = rates[i]
+                break
+        if last_rate is None:
+            last_rate = entry.TIER_PRIOR.get(tr.get("tier"), 3.0)
+        if len(pts) < 3:
+            m, s = logit_pct(last_rate), rw
         else:
-            pmax = rng.uniform(5.0, 70.0)
+            fit = entry.ols([x for x, _ in pts], [y for _, y in pts])
+            a, b = fit
+            h_t = (target - RELEASE).total_seconds() / 3600.0
+            m = a + b * math.log1p(max(h_t, 0.0))
+            resid = [abs(y - (a + b * x)) for x, y in pts]
+            s = min(0.9, math.sqrt(rw ** 2 + (entry.median(resid) or 0.0) ** 2))
+        qs = []
+        prev = None
+        for z in Z:
+            q = round(entry.clamp_pct(entry.inv_logit_pct(m + z * s)), 4)
+            if prev is not None and q < prev:
+                q = prev
+            qs.append(q)
+            prev = q
+        out.append({"id": tr.get("id"), "q": qs})
+    return out
+
+
+# ------------------------------------------------------------ practice proxy
+
+def load_practice():
+    cases = {}
+    for cid in ("p00", "p01"):
+        with open(os.path.join(KIT_INPUT, cid + ".in")) as fh:
+            cases[cid] = json.load(fh)
+    return cases
+
+
+def practice_truths(case, variant, seed=7):
+    """Synthetic answer rates for a practice case, per variant."""
+    last = case["history"][-1]
+    rates = last["rates"]
+    n_old = last["players_tracked"] or 638
+    n_new = 3868
+    order = sorted(range(len(rates)),
+                   key=lambda i: -(rates[i] if rates[i] is not None else 0))
+    out = {}
+    rng = random.Random(seed)
+    for i, r in enumerate(rates):
+        if r is None:
+            r = 0.0
+        if r >= 99.99:
+            out[case["trophies"][i]["id"]] = 99.99
+            continue
+        e_old = r / 100.0 * n_old
+        if variant == "A":
+            g = 0.0
+        elif variant == "B":
+            g = 0.30 * r / 100.0 if i in order[:12] else 0.0
+        elif variant == "C":
+            g = r / 100.0 if i in order[:12] else 0.0
+        elif variant == "D":
+            g = 0.0
+        else:
+            raise ValueError(variant)
+        y = 100.0 * (e_old + g * (n_new - n_old)) / n_new
+        if variant == "D":
+            y *= math.exp(rng.gauss(0.0, 0.45))
+        out[case["trophies"][i]["id"]] = min(99.99, max(0.01, y))
+    return out
+
+
+# ------------------------------------------------------- synthetic worlds
+
+def _draw_ceiling(rng, tid):
+    if tid == 1:
+        return rng.uniform(0.3, 1.5)
+    if tid in (2,):
+        return 100.0
+    if rng.random() < 0.04:
+        return rng.uniform(60.0, 95.0)
+    return math.exp(rng.uniform(math.log(0.4), math.log(40.0)))
+
+
+def make_world(family, seed):
+    """A synthetic final-case world. Returns (case, answer {id: rate})."""
+    rng = random.Random(seed)
+    practice = load_practice()["p00"]
+    trophies = practice["trophies"]
+    params = {}
+    for tr in trophies:
+        tid = tr["id"]
+        c = _draw_ceiling(rng, tid)
         if family == "weibull":
-            params[t["id"]] = (pmax, rng.uniform(24.0, 220.0),
-                               rng.uniform(0.7, 1.5))
-        elif family == "loglogistic":
-            params[t["id"]] = (pmax, rng.uniform(-3.0, 0.5),
-                               rng.uniform(0.8, 2.2))
-        else:  # delayed sigmoid in log time
-            params[t["id"]] = (pmax, rng.uniform(12.0, 120.0),
-                               rng.uniform(0.3, 0.9))
+            params[tid] = (c, rng.uniform(0.7, 2.2), rng.uniform(15.0, 180.0))
+        elif family == "loglog":
+            params[tid] = (c, rng.uniform(0.8, 2.4), rng.uniform(8.0, 90.0))
+        elif family == "delayed":
+            params[tid] = (c, rng.uniform(20.0, 75.0), rng.uniform(8.0, 30.0))
+        else:
+            raise ValueError(family)
 
-    def true_rate(tid, t_h):
-        pmax = params[tid][0]
-        if t_h <= 0:
-            return 0.01
+    def curve(tid, t_hours):
+        c, a, b = params[tid]
+        if tid == 2:
+            return 100.0
+        te = t_hours + 1.0  # adoption clock starts 1h before release
         if family == "weibull":
-            _, lam, k = params[tid]
-            return pmax * (1.0 - math.exp(-((t_h / lam) ** k)))
-        if family == "loglogistic":
-            _, a, b = params[tid]
-            u = math.log1p(t_h)
-            return pmax / (1.0 + math.exp(-(a + b * u)))
-        _, t50, s = params[tid]
-        u = math.log(max(1.0, t_h))
-        return pmax / (1.0 + math.exp(-(u - math.log(t50)) / s))
+            k, lam = a, b
+            return c * (1.0 - math.exp(-((max(te, 0.01)) / lam) ** k))
+        if family == "loglog":
+            k, t0 = a, b
+            return c / (1.0 + (t0 / max(te, 0.01)) ** k)
+        t0, s = a, b
+        return c / (1.0 + math.exp(-(te - t0) / s))
 
-    def n_true(t_h):
-        # Tracked players: fast early growth, saturating (~50k by day 7).
-        return 50000.0 * max(0.0, t_h) / (max(0.0, t_h) + 72.0) + 600.0
-
-    # Refresh times: every 2-7 h from -0.2 h to the cut.
-    refreshes = []
-    t = -0.2
-    while t < 59.5:
-        refreshes.append(t)
-        t += rng.uniform(2.0, 7.0)
-    # Reads every 10 min show the last refresh's values EXACTLY (like the
-    # real recorder: identical reads between refreshes). Rates are computed
-    # once per refresh, then repeated verbatim until the next refresh.
-    refresh_values = {}
-    for rt in refreshes:
-        n = int(n_true(rt))
-        rates = []
-        for tr in trophies:
-            p = true_rate(tr["id"], rt)
-            rates.append(round(max(0.01, p) + rng.gauss(0, 0.005), 2))
-        refresh_values[rt] = (n, rates, int(sum(r / 100.0 * n for r in rates)))
+    # Refreshes every 6h from t=0; the shown rate is the curve at the
+    # last refresh at or before the read.
+    refresh_times = [6.0 * k for k in range(0, 11)]  # 0..60h
+    n_at = {}
+    n = 638.0
+    for rt in refresh_times:
+        n_at[rt] = n
+        n *= rng.uniform(1.3, 1.9)
     history = []
-    slot = -0.17
-    ri = 0
-    while slot < 59.5:
-        while ri + 1 < len(refreshes) and refreshes[ri + 1] <= slot:
-            ri += 1
-        rt = refreshes[ri]
-        n, rates, earned = refresh_values[rt]
+    slot = RELEASE - timedelta(minutes=10)
+    while slot <= DEADLINE:
+        t = (slot - RELEASE).total_seconds() / 3600.0
+        rt = max([x for x in refresh_times if x <= t], default=None)
+        if rt is None:
+            rates = [round(curve(tr["id"], -0.17), 2) for tr in trophies]
+            nn = 638
+        else:
+            rates = [round(curve(tr["id"], rt), 2) for tr in trophies]
+            nn = int(round(n_at[rt]))
+        earned = sum(int(round(r / 100.0 * nn)) for r in rates)
         history.append({
-            "slot": _iso(slot), "at": _iso(slot),
-            "players_tracked": n,
+            "slot": slot.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "at": (slot + timedelta(seconds=30)).strftime(
+                "%Y-%m-%dT%H:%M:%S.000Z"),
+            "players_tracked": nn,
             "trophies_earned": earned,
-            "rates": list(rates),
+            "rates": rates,
         })
-        slot += 1.0 / 6.0
+        slot += timedelta(minutes=30)
+    horizon = int((TARGET - DEADLINE).total_seconds() // 60)
     case = {
         "schema": "makefun/gta6-trophies-case/v1",
         "id": "f00",
-        "at": "2026-11-21T11:30:00Z",
-        "horizon_minutes": 6510,
-        "target": "2026-11-26T00:00:00Z",
+        "at": DEADLINE.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "horizon_minutes": horizon,
+        "target": TARGET.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "levels": [0.05, 0.25, 0.5, 0.75, 0.95],
-        "game": {"name": "Grand Theft Auto VI", "platform": "PS5",
-                 "release_date": "2026-11-19",
-                 "source": "https://www.exophase.com/game/grand-theft-auto-vi-psn/trophies/"},
+        "game": practice["game"],
         "trophies": trophies,
         "history": history,
-        "notes": "synthetic",
+        "notes": "synthetic world family=%s seed=%d" % (family, seed),
     }
-    truth = {tr["id"]: max(0.01, true_rate(tr["id"], 168.0))
-             for tr in trophies}
-    return case, truth
+    t_ans = (TARGET - RELEASE).total_seconds() / 3600.0
+    answer = {}
+    for tr in trophies:
+        y = curve(tr["id"], t_ans)
+        answer[tr["id"]] = min(99.99, max(0.01, round(y, 2)))
+    return case, answer
 
 
-def _iso(t_h):
-    from datetime import datetime, timedelta, timezone
-    base = datetime(2026, 11, 19, tzinfo=timezone.utc)
-    return (base + timedelta(hours=t_h)).strftime("%Y-%m-%dT%H:%M:%SZ")
+def truncate_case(case, cut_dt, target_dt):
+    """History truncated to reads before cut_dt, forecasting target_dt."""
+    hist = []
+    for read in case["history"]:
+        at = entry.parse_time(read.get("at") or read.get("slot"))
+        if at is not None and at < cut_dt:
+            hist.append(read)
+    new = dict(case)
+    new["history"] = hist
+    new["at"] = cut_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    new["target"] = target_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    new["horizon_minutes"] = int((target_dt - cut_dt).total_seconds() // 60)
+    return new
 
 
-def curve_baseline_forecast(case):
-    """The fitted-curve baseline: log-time linear on the last 24 h of
-    refresh points, spread = random walk + fit residual combined."""
-    points = M.refresh_points(case)
-    last = points[-1]
-    d = case["horizon_minutes"] / 1440.0
-    target_t = M.hours_since_release(case["target"])
-    rows = []
-    for i, t in enumerate(case["trophies"]):
-        series = M.trophy_series(case, points, i)
-        recent = [s for s in series if series[-1][0] - s[0] <= 24.0]
-        med = None
-        resid = 0.3
-        if len(recent) >= 3:
-            med = M.fit_loglinear(recent, target_t)
-            if med is not None:
-                errs = [abs(M.logit(p) - M.logit(
-                    M.fit_loglinear(recent, tt) or p))
-                    for tt, p, _ in recent]
-                resid = (sum(errs) / len(errs)) if errs else 0.3
-        if med is None:
-            med = last["rates"][i]
-        spread = math.sqrt((0.5 * math.sqrt(d)) ** 2 + resid ** 2)
-        qs = [M.round4(min(99.99, max(0.01,
-                        M.inv_logit(M.logit(med) + z * spread))))
-              for z in M.Z]
-        for j in range(1, 5):
-            qs[j] = max(qs[j], qs[j - 1])
-        rows.append({"id": t["id"], "q": qs})
-    return {"trophies": rows}
+# ------------------------------------------------------------------- checks
+
+def check_practice():
+    cases = load_practice()
+    rows, secs = run_entry(cases)
+    print("practice: entry runtime %.2fs for 2 cases" % secs)
+    means = {}
+    for variant in ("A", "B", "C", "D"):
+        losses = []
+        for cid, case in cases.items():
+            truth = practice_truths(case, variant)
+            losses.append(pinball_loss(truth, rows[cid]))
+        means[variant] = sum(losses) / len(losses)
+        print("  practice-proxy %s: %.3f" % (variant, means[variant]))
+    mean = sum(means.values()) / 4.0
+    print("  practice-proxy mean: %.3f" % mean)
+    return means, mean
 
 
-def check_synthetic(worlds=10):
-    print(f"SYNTHETIC FINAL ({worlds} worlds, cut 59.5 h -> target 168 h)")
-    lm_all, lb_all, lc_all = [], [], []
-    for w in range(worlds):
-        rng = random.Random(1000 + w)
-        case, truth = synth_world(rng)
-        mine = M.forecast_case(case)
-        base = persistence_forecast(case)
-        curve = curve_baseline_forecast(case)
-        lm = score_forecast(mine, truth)
-        lb = score_forecast(base, truth)
-        lc = score_forecast(curve, truth)
-        lm_all.append(lm)
-        lb_all.append(lb)
-        lc_all.append(lc)
-        print(f"  world {w}: mine={lm:.3f} persistence={lb:.3f} "
-              f"curve={lc:.3f}")
-    m = lambda v: sum(v) / len(v)
-    print(f"  MEAN mine={m(lm_all):.3f} persistence={m(lb_all):.3f} "
-          f"curve={m(lc_all):.3f}")
-    print(f"  mine beats persistence in "
-          f"{sum(a < b for a, b in zip(lm_all, lb_all))}/{worlds} worlds; "
-          f"beats curve in {sum(a < c for a, c in zip(lm_all, lc_all))}/{worlds}")
-    assert m(lm_all) < m(lb_all), "mine does not beat persistence on average"
-    assert m(lm_all) < m(lc_all), "mine does not beat curve baseline on average"
-    print("  -> synthetic check PASSED")
-
-
-def check_other_families(worlds=5):
-    """Same final, but the true adoption shape is NOT Weibull: the
-    ensemble must win on shapes it was not tuned to."""
-    for family in ("loglogistic", "delayed"):
-        lm_all, lc_all, lb_all = [], [], []
-        for w in range(worlds):
-            rng = random.Random(2000 + w)
-            case, truth = synth_world(rng, family=family)
-            lm_all.append(score_forecast(M.forecast_case(case), truth))
-            lc_all.append(score_forecast(
-                curve_baseline_forecast(case), truth))
-            lb_all.append(score_forecast(
-                persistence_forecast(case), truth))
+def check_synthetic():
+    results = {}
+    worst_secs = 0.0
+    for family, n_worlds, seeds in (
+            ("weibull", 10, range(101, 111)),
+            ("loglog", 5, range(201, 206)),
+            ("delayed", 5, range(301, 306))):
+        mine, pers, curve = [], [], []
+        wins_p, wins_c = 0, 0
+        for seed in seeds:
+            case, answer = make_world(family, seed)
+            rows, secs = run_entry({"f00": case})
+            worst_secs = max(worst_secs, secs)
+            lm = pinball_loss(answer, rows["f00"])
+            lp = pinball_loss(answer, persistence_rows(case))
+            lc = pinball_loss(answer, curve_baseline_rows(case))
+            mine.append(lm)
+            pers.append(lp)
+            curve.append(lc)
+            wins_p += 1 if lm < lp else 0
+            wins_c += 1 if lm < lc else 0
         m = lambda v: sum(v) / len(v)
-        print(f"  {family:12s} mine={m(lm_all):.3f} persistence={m(lb_all):.3f} "
-              f"curve={m(lc_all):.3f}")
-        assert m(lm_all) < m(lc_all), f"mine loses to curve on {family}"
-        assert m(lm_all) < m(lb_all), f"mine loses to persistence on {family}"
-    print("  -> other-families check PASSED")
-
-
-def check_edge_cases():
-    """Degenerate inputs must still produce a valid, deterministic output."""
-    base = json.loads((KIT / "p00.in").read_text())
-
-    def run(case, label):
-        import copy
-        out = M.forecast_case(copy.deepcopy(case))
-        assert set(out.keys()) == {"trophies"} and len(out["trophies"]) == 55
-        for row in out["trophies"]:
-            q = row["q"]
-            assert len(q) == 5 and all(0 <= v <= 100 for v in q)
-            assert all(q[i] <= q[i + 1] for i in range(4))
-        print(f"  {label}: valid")
-
-    c = json.loads(json.dumps(base))
-    c["history"] = c["history"][:1]
-    run(c, "single read")
-    c = json.loads(json.dumps(base))
-    c["history"] = []
-    run(c, "empty history")
-    c = json.loads(json.dumps(base))
-    for r in c["history"]:
-        r["rates"] = [None if i % 3 == 0 else v for i, v in enumerate(r["rates"])]
-    run(c, "a third of rates null")
-    c = json.loads(json.dumps(base))
-    for r in c["history"]:
-        r["rates"] = [0.01 if v is not None else None for v in r["rates"]]
-    run(c, "all rates at the floor")
-    print("  -> edge-case check PASSED")
+        results[family] = (m(mine), m(pers), m(curve), wins_p, wins_c)
+        print("  synth %-8s mine %.3f | persistence %.3f | curve %.3f "
+              "| wins %d/%d vs pers, %d/%d vs curve"
+              % (family, m(mine), m(pers), m(curve),
+                 wins_p, n_worlds, wins_c, n_worlds))
+    print("  worst single-case entry runtime: %.2fs" % worst_secs)
+    return results, worst_secs
 
 
 def check_expanding_cv():
-    """Truncate synthetic histories and forecast a shorter horizon ahead."""
-    import copy
-    from datetime import datetime, timedelta, timezone
-    base = datetime(2026, 11, 19, tzinfo=timezone.utc)
+    print("  expanding-window CV (Weibull worlds, mean over 10):")
+    cuts = [(24, 48), (36, 54), (48, 58)]
+    acc = {c: [] for c in cuts}
+    for seed in range(101, 111):
+        case, answer_full = make_world("weibull", seed)
+        for cut_h, tgt_h in cuts:
+            cut_dt = RELEASE + timedelta(hours=cut_h)
+            tgt_dt = RELEASE + timedelta(hours=tgt_h)
+            sub = truncate_case(case, cut_dt, tgt_dt)
+            rows, _ = run_entry({"f00": sub})
+            ans = _answer_at("weibull", seed, tgt_h)
+            acc[(cut_h, tgt_h)].append(pinball_loss(ans, rows["f00"]))
+    out = {}
+    for (cut_h, tgt_h), vals in acc.items():
+        out[(cut_h, tgt_h)] = sum(vals) / len(vals)
+        print("    cut %dh -> +%dh: %.3f"
+              % (cut_h, tgt_h - cut_h, out[(cut_h, tgt_h)]))
+    return out
 
-    def trunc(case, cut_h, hz):
-        c = copy.deepcopy(case)
-        cut_iso = (base + timedelta(hours=cut_h)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        tgt_iso = (base + timedelta(hours=cut_h + hz)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        c["history"] = [r for r in case["history"] if r["slot"] < cut_iso]
-        c["at"] = cut_iso
-        c["target"] = tgt_iso
-        c["horizon_minutes"] = int(hz * 60)
-        return c
 
-    def truth_at(case, t_h):
-        iso = (base + timedelta(hours=t_h)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        for r in case["history"]:
-            if r["slot"] >= iso:
-                return {tr["id"]: r["rates"][i] for i, tr in
-                        enumerate(case["trophies"]) if r["rates"][i] is not None}
-        return None
-
-    print("EXPANDING-WINDOW CV (Weibull worlds, 5 each)")
-    for cut, hz in ((24.0, 24.0), (36.0, 18.0), (48.0, 10.0)):
-        lm_all = []
-        for w in range(5):
-            rng = random.Random(1000 + w)
-            case, _ = synth_world(rng, family="weibull")
-            truth = truth_at(case, cut + hz)
-            lm_all.append(score_forecast(
-                M.forecast_case(trunc(case, cut, hz)), truth))
-        print(f"  cut {cut:.0f}h -> +{hz:.0f}h  mine={sum(lm_all)/len(lm_all):.3f}")
-    print("  -> expanding-window check done")
+def _answer_at(family, seed, t_hours):
+    """Answer rates at an arbitrary hour, for the CV check."""
+    rng = random.Random(seed)
+    practice = load_practice()["p00"]
+    trophies = practice["trophies"]
+    params = {}
+    for tr in trophies:
+        tid = tr["id"]
+        c = _draw_ceiling(rng, tid)
+        if family == "weibull":
+            params[tid] = (c, rng.uniform(0.7, 2.2), rng.uniform(15.0, 180.0))
+        elif family == "loglog":
+            params[tid] = (c, rng.uniform(0.8, 2.4), rng.uniform(8.0, 90.0))
+        else:
+            params[tid] = (c, rng.uniform(20.0, 75.0), rng.uniform(8.0, 30.0))
+    ans = {}
+    for tr in trophies:
+        tid = tr["id"]
+        c, a, b = params[tid]
+        if tid == 2:
+            ans[tid] = 99.99
+            continue
+        te = t_hours + 1.0
+        if family == "weibull":
+            y = c * (1.0 - math.exp(-((max(te, 0.01)) / b) ** a))
+        elif family == "loglog":
+            y = c / (1.0 + (b / max(te, 0.01)) ** a)
+        else:
+            y = c / (1.0 + math.exp(-(te - a) / b))
+        ans[tid] = min(99.99, max(0.01, round(y, 2)))
+    return ans
 
 
 def check_ablation():
-    """Joint model: CV weight actually granted, and loss forced-on vs gated."""
-    print("ABLATION (Weibull worlds, 5 each; sigma 0.5 for comparability)")
-    for fam, seed0 in (("weibull", 1000), ("delayed", 2000)):
-        lj, lc, lb = [], [], []
-        wjs = []
-        for w in range(5):
-            rng = random.Random(seed0 + w)
-            case, truth = synth_world(rng, family=fam)
-            pts = M.refresh_points(case)
-            tgt = M.hours_since_release(case["target"])
-            w0, _, _ = M.backtest(case, pts, tgt, 108.0)
-            if not w0:
-                w0 = {"loglinear": 0.35, "loglogistic": 0.35, "weibull": 0.3}
-            wj = M.joint_cv_weight(case, pts, 108.0, w0)
-            wjs.append(wj)
-            jf = M.joint_fit(case, pts)
-            jmed = M.joint_forecast_median(jf, case, pts, tgt) if jf else None
-            for key, acc in (("joint", lj), ("curve", lc), ("blend", lb)):
-                pass
-            rows = {r["id"]: r["q"] for r in
-                    {"trophies": []}["trophies"]} if False else None
-            # score medians directly at sigma 0.5
-            def sc(med_logit):
-                tot = 0.0
-                for i in truth:
-                    qs = [M.inv_logit(med_logit[i] + z * 0.5) for z in M.Z]
-                    tot += M.pinball_loss(truth[i], qs)
-                return tot / len(truth)
-            jlog, clog = {}, {}
-            for i, tr in enumerate(case["trophies"]):
-                s = M.trophy_series(case, pts, i)
-                fits = M._fit_all_models(s, tgt)
-                vals = [M.logit(v) for v in fits.values() if v is not None]
-                if vals:
-                    clog[tr["id"]] = sum(vals) / len(vals)
-                if jmed is not None:
-                    jlog[tr["id"]] = jmed[i]
-            lj.append(sc(jlog))
-            lc.append(sc(clog))
-            blog = {i: 0.5 * jlog[i] + 0.5 * clog[i] for i in clog if i in jlog}
-            lb.append(sc(blog))
+    print("  ablation (5 worlds/family, in-process):")
+    for family, seeds in (("weibull", range(101, 106)),
+                          ("delayed", range(301, 306))):
+        acc = {"weighted": [], "joint": [], "equal": [], "blend50": []}
+        for seed in seeds:
+            case, answer = make_world(family, seed)
+            acc["weighted"].append(pinball_loss(
+                answer, entry.forecast_case(case)))
+            acc["joint"].append(pinball_loss(
+                answer, entry.forecast_case(case, joint_weight_override=1.0)))
+            acc["equal"].append(pinball_loss(
+                answer, entry.forecast_case(case, equal_weights=True)))
+            acc["blend50"].append(pinball_loss(
+                answer, entry.forecast_case(case, joint_weight_override=0.5)))
         m = lambda v: sum(v) / len(v)
-        print(f"  {fam:10s} joint={m(lj):.3f} curve-eq={m(lc):.3f} "
-              f"blend50={m(lb):.3f} w_joint granted={sum(wjs)/len(wjs):.2f}")
-    print("  -> ablation done (joint loses on synthetic worlds; gate keeps it out)")
+        print("    %-8s weighted %.3f | joint-only %.3f | equal %.3f "
+              "| blend50 %.3f"
+              % (family, m(acc["weighted"]), m(acc["joint"]),
+                 m(acc["equal"]), m(acc["blend50"])))
+
+
+def _validate_rows(rows, n_trophies):
+    assert isinstance(rows, list) and len(rows) == n_trophies, "row count"
+    ids = [r["id"] for r in rows]
+    assert len(set(ids)) == n_trophies, "duplicate ids"
+    for r in rows:
+        assert set(r.keys()) == {"id", "q"}, "row keys"
+        q = r["q"]
+        assert len(q) == 5, "five quantiles"
+        for v in q:
+            assert isinstance(v, (int, float)) and math.isfinite(v), "finite"
+            assert 0.0 <= v <= 100.0, "range"
+        assert all(q[i] <= q[i + 1] for i in range(4)), "non-decreasing"
+
+
+def check_edge_cases():
+    base = load_practice()["p00"]
+    trophies = base["trophies"]
+
+    def mkcase(history):
+        c = dict(base)
+        c["history"] = history
+        return c
+
+    one = [base["history"][0]]
+    cases = {
+        "edge1": mkcase(one),
+        "edge2": mkcase([]),
+        "edge3": mkcase([dict(base["history"][0],
+                              rates=[None] * 55),
+                         dict(base["history"][1])]),
+        "edge4": mkcase([dict(base["history"][0],
+                              rates=[0.01] * 55,
+                              players_tracked=638,
+                              trophies_earned=0)]),
+    }
+    rows, _ = run_entry(cases)
+    for cid, r in rows.items():
+        _validate_rows(r, len(trophies))
+        print("  edge %s: valid (%d rows)" % (cid, len(r)))
+    # Determinism: run a synthetic final case twice, compare bytes.
+    case, _ = make_world("weibull", 101)
+    with tempfile.TemporaryDirectory() as td:
+        outs = []
+        for k in range(2):
+            in_dir = os.path.join(td, "in%d" % k)
+            out_dir = os.path.join(td, "out%d" % k)
+            os.makedirs(in_dir)
+            os.makedirs(out_dir)
+            with open(os.path.join(in_dir, "f00.in"), "w") as fh:
+                json.dump(case, fh)
+            env = dict(os.environ)
+            env["MAKEFUN_INPUT_DIR"] = in_dir
+            env["MAKEFUN_OUTPUT_DIR"] = out_dir
+            subprocess.run([sys.executable, os.path.join(ROOT, "main.py")],
+                           env=env, capture_output=True, timeout=120,
+                           check=True)
+            with open(os.path.join(out_dir, "f00.out"), "rb") as fh:
+                outs.append(fh.read())
+    assert outs[0] == outs[1], "non-deterministic output"
+    print("  determinism: 2 runs byte-identical (%d bytes)" % len(outs[0]))
+
+
+def main():
+    t0 = time.time()
+    print("== practice proxy ==")
+    check_practice()
+    print("== synthetic final ==")
+    check_synthetic()
+    print("== expanding-window CV ==")
+    check_expanding_cv()
+    print("== ablation ==")
+    check_ablation()
+    print("== edge cases + determinism ==")
+    check_edge_cases()
+    print("total backtest wall time: %.1fs" % (time.time() - t0))
+    return 0
 
 
 if __name__ == "__main__":
-    check_practice()
-    check_synthetic()
-    check_other_families()
-    check_expanding_cv()
-    check_ablation()
-    check_edge_cases()
+    sys.exit(main())

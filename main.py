@@ -1,177 +1,111 @@
-"""GTA VI trophy-rarity forecaster, v2 — for make.fun's
-gta6-trophy-rarity-forecast-01.
+#!/usr/bin/env python3
+"""GTA VI trophy rarity forecast -- v2 (fresh rewrite).
 
-Forecasts, for each of the game's 55 trophies, five quantiles of its
-Exophase earn rate at the case target, scored by pinball loss on the
-logit scale.
+Forecasts every trophy's Exophase earn rate at the case target as five
+quantiles, scored by pinball loss on the logit scale.
 
-What the data does (from the kit's competition.yaml and NOTICE):
-Exophase refreshes a game's counts on its own schedule, hours apart.
-Between refreshes every read repeats the last refresh exactly. At a
-refresh the tracked-player count jumps and every rate but the 100% one
-falls: newly tracked players hold far fewer trophies. A forecaster
-that just repeats the last read therefore misses by ~1.5 logit units
-when a refresh lands inside its horizon.
+Method (from the design notes, written from scratch in this session):
+  * Collapse the history to *refresh points*: consecutive reads that are
+    byte-identical in rates and players-tracked carry no new information
+    (Exophase refreshes its counts hours apart, not continuously).
+  * Per trophy, fit three curves in logit space on the refresh points:
+    log-linear (logit rate linear in log time), log-logistic (a ceiling
+    fit: logit(rate / ceiling) linear in log time, ceiling chosen by
+    grid search), and Weibull (rate = C * (1 - exp(-(t/lam)^k)) fitted
+    by a two-stage grid: coarse (k, lam) grid, then two rounds of local
+    refinement, lam steps x1.15, k +-0.15). All three fits weight
+    recent refresh points more (linear recency weights): the current
+    regime is what a far-horizon extrapolation depends on.
+  * Ensemble weights come from a rolling-origin backtest inside the
+    history itself (fit on early refresh points, predict the next one).
+  * Spread comes from the median residual of the weighted ensemble,
+    growing log-wise with the horizon, capped at 0.9 logit.
+  * Flat history (a single refresh point) falls back to a dilution
+    prior: the tracked-player count is assumed to multiply by the
+    median jump seen in the history itself, else 5x, and the new
+    players are assumed to hold almost no trophies except the very
+    earliest few.
+  * A joint hierarchical binomial model (per-trophy intercepts shrunk
+    to PAVA-ordered tier means, an RW2-smoothed common time trend,
+    a shrunk dilution coefficient) is fitted in full, but it is only
+    blended in when its expanding-window cross-validation beats the
+    weighted curve ensemble by at least 10% (blend weight at most
+    0.30); otherwise its weight is exactly 0.
 
-Method (see NOTES-v2.md for the validation numbers behind each choice):
-
-1. Collapse the history to refresh points. Consecutive identical reads
-   carry no information; a refresh point is the page's true state.
-2. Per trophy, fit three saturating adoption curves to the refresh
-   points on the logit scale (log-time linear, log-logistic with a
-   fitted ceiling, Weibull adoption). The Weibull fit uses a two-stage
-   grid: a coarse (k, lam) grid, then local refinement around the best
-   cell. The coarse grid alone left ~0.1 logit of median error on
-   synthetic Weibull worlds; refinement recovers most of it.
-3. Weight the three curves by rolling-origin backtest inside the
-   history: fit each curve on refresh points up to an origin, score its
-   pinball loss against a later refresh point, pool over trophies.
-4. Joint hierarchical model, fitted in parallel and blended in only
-   when it earns its place: earns ~ Binomial(players, p) with
-   logit p[t,i] = alpha[i] + f(t) + delta*log(N[t]/N[0]), alpha[i]
-   shrunk toward PAVA-ordered tier means (bronze > silver > gold >
-   platinum in logit), f(t) an RW2-smoothed shared trend over refresh
-   points, delta a shrunk dilution coefficient. It is blended with the
-   curve ensemble only if its own expanding-window CV pinball beats
-   the backtest-weighted curves' by at least 10% at the longest
-   horizon the history supports (weight capped at 0.30); otherwise
-   its weight is exactly zero. On every synthetic check run so far the
-   joint model loses to the curves (parallel logit curves are the wrong
-   shape when each trophy has its own adoption speed), so the gate
-   keeps it out there — it exists for the real final history, where a
-   refresh drops every trophy's rate together and a shared component
-   may genuinely help.
-5. Spread from the backtest residuals of the blended median, grown
-   slowly (log-wise) with the horizon and capped.
-6. Flat history (no movement, as on launch night) carries no trend
-   signal, so the forecast falls back to a dilution prior: a refresh
-   is expected, the tracked count multiplies (median jump observed in
-   the history's own refreshes when any exist, else 5x), and newly
-   tracked players hold almost nothing yet except the very first
-   trophies, so rates fall by roughly the N factor, with a wide
-   spread. A trophy already at 100% stays there.
-
-Standard library only, no network, deterministic (two runs on the
-same case write identical bytes), inside the 8 s / 1 CPU / 1 GiB
-budget.
+Stdlib only, deterministic, no network.
 """
 
+import glob
 import json
 import math
 import os
 import sys
-from pathlib import Path
-from statistics import NormalDist
+from datetime import datetime, timezone
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
-OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
-
-LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
-_NORM = NormalDist()
-Z = [_NORM.inv_cdf(t) for t in LEVELS]
-
-RELEASE = "2026-11-19T00:00:00Z"  # the game's release day, 00:00 UTC.
-# Tier order, rarest first; tier means in logit are non-decreasing along it.
+Z = (-1.645, -0.674, 0.0, 0.674, 1.645)
+FLOOR = 0.01
+CEIL = 99.99
 TIER_ORDER = ["platinum", "gold", "silver", "bronze"]
-TIER_IDX = {name: k for k, name in enumerate(TIER_ORDER)}
+# Tier prior rates (percent) used only when a trophy has no usable rate
+# anywhere in the history.
+TIER_PRIOR = {"platinum": 0.5, "gold": 1.0, "silver": 2.0, "bronze": 3.0}
 
 
-def clamp_pct(p):
-    """A rate in percent, clamped to the range the scorer's logit uses."""
-    return min(99.99, max(0.01, p))
+# ---------------------------------------------------------------- helpers
+
+def clamp_pct(x):
+    if x is None or (isinstance(x, float) and (math.isnan(x) or math.isinf(x))):
+        return None
+    return min(CEIL, max(FLOOR, float(x)))
 
 
-def logit(pct):
-    p = clamp_pct(pct)
-    return math.log(p / (100.0 - p))
+def logit_pct(p):
+    p = clamp_pct(p)
+    q = p / 100.0
+    return math.log(q / (1.0 - q))
 
 
-def inv_logit(y):
-    if y >= 0:
-        return 100.0 / (1.0 + math.exp(-y))
-    e = math.exp(y)
-    return 100.0 * e / (1.0 + e)
-
-
-def round4(x):
-    """x rounded to 4 decimals, half up, as JavaScript's Math.round does."""
-    scaled = x * 10000
-    whole = math.floor(scaled)
-    if scaled - whole >= 0.5:
-        whole += 1
-    value = whole / 10000
-    return int(value) if value.is_integer() else value
+def inv_logit_pct(y):
+    if y > 30.0:
+        return CEIL
+    if y < -30.0:
+        return FLOOR
+    return 100.0 / (1.0 + math.exp(-y))
 
 
 def parse_time(s):
-    """ISO-8601 UTC timestamp -> seconds since the epoch (float)."""
-    if s.endswith("Z"):
-        s = s[:-1] + "+00:00"
-    from datetime import datetime
-
-    return datetime.fromisoformat(s).timestamp()
-
-
-def hours_since_release(when):
-    return (parse_time(when) - parse_time(RELEASE)) / 3600.0
-
-
-# ---------------------------------------------------------------------------
-# History: refresh points and per-trophy series.
-# ---------------------------------------------------------------------------
-
-def refresh_points(case):
-    """The history collapsed to its distinct refreshes.
-
-    Consecutive reads with the same players_tracked and the same rates
-    are one refresh repeated; keep the first read of each run. A read
-    whose rates are all null carries nothing and is dropped.
-    """
-    points = []
-    prev_key = None
-    for read in case.get("history", []):
-        rates = read.get("rates") or []
-        if not rates or all(r is None for r in rates):
-            continue
-        key = (read.get("players_tracked"), tuple(rates))
-        if key == prev_key:
-            continue
-        prev_key = key
-        points.append(read)
-    return points
+    if s is None:
+        return None
+    if isinstance(s, (int, float)):
+        return datetime.fromtimestamp(s, tz=timezone.utc)
+    txt = str(s).strip()
+    if txt.endswith("Z"):
+        txt = txt[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(txt)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
-def trophy_series(case, points, idx):
-    """[(t_hours, rate, players_tracked)] for one trophy, oldest first."""
-    series = []
-    for read in points:
-        rates = read.get("rates") or []
-        if idx >= len(rates):
-            continue
-        rate = rates[idx]
-        if rate is None:
-            continue
-        n = read.get("players_tracked")
-        series.append((hours_since_release(read["slot"]), float(rate), n))
-    return series
+def ols(xs, ys):
+    """Least squares y ~ a + b*x. Returns (a, b) or None."""
+    n = len(xs)
+    if n < 2:
+        return None
+    mx = sum(xs) / n
+    my = sum(ys) / n
+    sxx = sum((x - mx) ** 2 for x in xs)
+    if sxx <= 1e-12:
+        return (my, 0.0)
+    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    b = sxy / sxx
+    return (my - b * mx, b)
 
 
-def series_moved(series):
-    """Largest absolute logit move inside a series (0 when flat)."""
-    if len(series) < 2:
-        return 0.0
-    ys = [logit(p) for _, p, _ in series]
-    return max(ys) - min(ys)
-
-
-def _weights(times, now):
-    """Recency weights: a read a day old counts half as much as a fresh one."""
-    return [0.5 ** max(0.0, (now - t) / 24.0) for t in times]
-
-
-def _wls_line(xs, ys, ws):
+def wols(xs, ys, ws):
     """Weighted least squares y ~ a + b*x. Returns (a, b) or None."""
     sw = sum(ws)
     if sw <= 0 or len(xs) < 2:
@@ -180,712 +114,831 @@ def _wls_line(xs, ys, ws):
     my = sum(w * y for w, y in zip(ws, ys)) / sw
     sxx = sum(w * (x - mx) ** 2 for w, x in zip(ws, xs))
     if sxx <= 1e-12:
-        return None
+        return (my, 0.0)
     sxy = sum(w * (x - mx) * (y - my) for w, x, y in zip(ws, xs, ys))
     b = sxy / sxx
     return (my - b * mx, b)
 
 
-def _thin(series, max_n=48):
-    """Evenly thin a series to at most max_n points, keeping first/last."""
-    if len(series) <= max_n:
-        return series
-    idx = sorted({round(i * (len(series) - 1) / (max_n - 1))
-                  for i in range(max_n)})
-    return [series[i] for i in idx]
+def recency_weights(pts):
+    """Linear recency weights: the most recent refresh point counts
+    most. Recent reads carry the current regime, which is what an
+    extrapolation to a far target actually depends on."""
+    t_last = pts[-1][0]
+    if t_last <= 0:
+        return [1.0] * len(pts)
+    return [t / t_last for t, _ in pts]
 
 
-# ---------------------------------------------------------------------------
-# Curve fits. Each takes [(t_hours, rate, n)] and a target time in hours
-# since release, and returns a median rate in percent (or None).
-# ---------------------------------------------------------------------------
-
-def fit_loglinear(series, target_t):
-    """y = a + b*ln(1+t): the curve baseline's shape, all history weighted."""
-    if len(series) < 2:
-        return None
-    now = series[-1][0]
-    xs = [math.log1p(max(0.0, t)) for t, _, _ in series]
-    ys = [logit(p) for _, p, _ in series]
-    ws = _weights([t for t, _, _ in series], now)
-    line = _wls_line(xs, ys, ws)
-    if line is None:
-        return None
-    a, b = line
-    return inv_logit(a + b * math.log1p(max(0.0, target_t)))
+def median(vals):
+    v = sorted(vals)
+    n = len(v)
+    if n == 0:
+        return 0.0
+    if n % 2 == 1:
+        return v[n // 2]
+    return 0.5 * (v[n // 2 - 1] + v[n // 2])
 
 
-def fit_loglogistic(series, target_t):
-    """p = Pmax * sigmoid(a + b*ln(1+t)): a saturating curve with a fitted
-    ceiling. Pmax is profiled over a grid; (a, b) are least squares given it.
+# ------------------------------------------------------------ refresh points
+
+def refresh_points(case):
+    """Collapse history to distinct states.
+
+    Returns (points, t_target, horizon_days, n_first) where points is a
+    list of dicts {t, n, rates} with t = 1 + hours since the first read,
+    and rates the raw percents (None where missing).
     """
-    if len(series) < 3:
-        return None
-    now = series[-1][0]
-    us = [math.log1p(max(0.0, t)) for t, _, _ in series]
-    ps = [p for _, p, _ in series]
-    ws = _weights([t for t, _, _ in series], now)
-    pmax_seen = max(ps)
-    best = None
-    lo = min(99.9, pmax_seen * 1.05 + 0.05)
-    for k in range(25):
-        frac = k / 24.0
-        pmax = lo + (99.9 - lo) * frac * frac
-        ys = []
-        ok = True
-        for p in ps:
-            r = p / pmax
-            if r <= 0.001 or r >= 0.999:
-                ok = False
-                break
-            ys.append(math.log(r / (1.0 - r)))
-        if not ok:
+    hist = case.get("history") or []
+    target = parse_time(case.get("target"))
+    horizon_min = case.get("horizon_minutes") or 0
+    points = []
+    t0 = None
+    for read in hist:
+        at = parse_time(read.get("at") or read.get("slot"))
+        if at is None:
             continue
-        line = _wls_line(us, ys, ws)
-        if line is None:
-            continue
-        a, b = line
-        sse = 0.0
-        for w, u, y in zip(ws, us, ys):
-            sse += w * (a + b * u - y) ** 2
-        if best is None or sse < best[0]:
-            best = (sse, pmax, a, b)
-    if best is None:
-        return None
-    _, pmax, a, b = best
-    u_t = math.log1p(max(0.0, target_t))
-    s = 1.0 / (1.0 + math.exp(-(a + b * u_t)))
-    return min(99.99, pmax * s)
-
-
-def _weibull_cell(ts, ps, ws, k, lam):
-    """Best Pmax and SSE for one (k, lam) cell, or None if degenerate."""
-    ss = []
-    for t in ts:
-        x = t / lam if lam > 0 else 0.0
-        ss.append(1.0 - math.exp(-(x ** k)) if x > 0 else 0.0)
-    num = sum(w * p * s for w, p, s in zip(ws, ps, ss))
-    den = sum(w * s * s for w, s in zip(ws, ss))
-    if den <= 1e-12:
-        return None
-    pmax = num / den
-    if pmax <= 0 or pmax > 120.0:
-        return None
-    sse = 0.0
-    for w, p, s in zip(ws, ps, ss):
-        sse += w * (pmax * s - p) ** 2
-    return (sse, pmax, k, lam)
-
-
-def fit_weibull(series, target_t):
-    """p = Pmax * (1 - exp(-(t/lam)^k)): a classic adoption curve.
-
-    Stage 1 grids k and lam coarsely; stage 2 refines both around the
-    best cell (lam in x1.15 steps, k in 0.05 steps, two rounds). The
-    coarse grid alone (lam doubling) misplaces lam by up to ~40% and
-    costs ~0.1 logit of median accuracy on synthetic Weibull worlds;
-    refinement recovers most of it for ~2x the cells of one extra
-    coarse level, not the 10x of a uniformly fine grid.
-    """
-    if len(series) < 3:
-        return None
-    ts = [max(0.0, t) for t, _, _ in series]
-    ps = [p for _, p, _ in series]
-    now = ts[-1]
-    ws = _weights(ts, now)
-    best = None
-    for k in (0.4, 0.6, 0.8, 1.0, 1.3, 1.7, 2.2):
-        for lam in (3.0, 6.0, 12.0, 24.0, 48.0, 96.0, 192.0, 384.0):
-            cell = _weibull_cell(ts, ps, ws, k, lam)
-            if cell is not None and (best is None or cell[0] < best[0]):
-                best = cell
-    if best is None:
-        return None
-    for _ in range(2):
-        _, _, bk, blam = best
-        for dk in (-0.15, -0.1, -0.05, 0.0, 0.05, 0.1, 0.15):
-            k = bk + dk
-            if k < 0.2 or k > 3.0:
-                continue
-            for f in (0.66, 0.76, 0.87, 1.0, 1.15, 1.32, 1.52):
-                cell = _weibull_cell(ts, ps, ws, k, blam * f)
-                if cell is not None and cell[0] < best[0]:
-                    best = cell
-    _, pmax, k, lam = best
-    x = max(0.0, target_t) / lam
-    return min(99.99, pmax * (1.0 - math.exp(-(x ** k))))
-
-
-MODELS = [
-    ("loglinear", fit_loglinear),
-    ("loglogistic", fit_loglogistic),
-    ("weibull", fit_weibull),
-]
-
-
-def _fit_all_models(series, target_t):
-    """Median of each ensemble member at target_t (None where it cannot)."""
-    series = _thin(series)
-    out = {}
-    for name, fn in MODELS:
-        try:
-            out[name] = fn(series, target_t)
-        except Exception:
-            out[name] = None
-    return out
-
-
-# ---------------------------------------------------------------------------
-# Flat-history fallback: the dilution prior.
-# ---------------------------------------------------------------------------
-
-def earliness(trophy):
-    """How early in a playthrough a trophy is earned: 2 early, 1 mid, 0 late.
-
-    From the trophy's own description: story chapters and first missions
-    come first, side content next, grinds / collections / 100% last.
-    """
-    name = (trophy.get("name") or "").lower()
-    desc = (trophy.get("description") or "").lower()
-    text = name + " " + desc
-    if trophy.get("tier") == "platinum":
-        return 0
-    if "chapter 1" in text or "gone fishing" in text:
-        return 2
-    if "breakfast run" in text or "chapter 2" in text:
-        return 2
-    if "chapter 3" in text or "try each type of activity" in text:
-        return 1
-    if "complete chapter" in text or "final mission" in text:
-        return 0
-    if "100% completion" in text or "250 stunts" in text:
-        return 0
-    if "collect" in text or "every location" in text or "every spot" in text:
-        return 0
-    if "complete" in text and ("mission" in text or "heist" in text):
-        return 1
-    return 1
-
-
-# Newly tracked players' earn rate, relative to the currently tracked
-# population's, by earliness: they have barely played yet, so they hold
-# almost nothing except the very first trophies.
-NEW_PLAYER_RELATIVE = {2: 0.15, 1: 0.05, 0: 0.02}
-
-
-def n_multiplier_prior(points):
-    """Tracked-count multiplier expected at the next refresh.
-
-    The median jump across the history's own refreshes when any exist
-    (launch night's one observed refresh was ~6x); a 5x prior when the
-    history is flat and no jump has ever been seen.
-    """
-    ratios = []
-    prev = None
-    for read in points:
+        if t0 is None:
+            t0 = at
+        rates = read.get("rates") or []
         n = read.get("players_tracked")
-        if n and prev and n > prev:
-            ratios.append(n / prev)
-        if n:
-            prev = n
-    if not ratios:
-        return 5.0
-    ratios.sort()
-    return min(8.0, max(1.5, ratios[len(ratios) // 2]))
+        try:
+            n = float(n) if n is not None else None
+        except (TypeError, ValueError):
+            n = None
+        if points:
+            prev = points[-1]
+            if prev["n"] == n and prev["rates"] == list(rates):
+                continue
+        t = 1.0 + (at - t0).total_seconds() / 3600.0
+        points.append({"t": t, "n": n, "rates": list(rates)})
+    if target is not None and t0 is not None:
+        t_target = 1.0 + (target - t0).total_seconds() / 3600.0
+    else:
+        t_target = 1.0 + horizon_min / 60.0
+    horizon_days = max(horizon_min, 0.0) / 1440.0
+    n_first = points[0]["n"] if points else None
+    return points, t_target, horizon_days, n_first
 
 
-def dilution_median(last_rate, trophy, mult):
-    """Median rate after the expected refresh: earners grow a little
-    (new players earn at a fraction g of the old rate) while the tracked
-    count multiplies by m: f = (1 + g*(m-1)) / m. A trophy at 100% stays.
-    """
-    if last_rate >= 99.99:
-        return 100.0
-    g = NEW_PLAYER_RELATIVE[earliness(trophy)]
-    f = (1.0 + g * (mult - 1.0)) / mult
-    return min(99.99, max(0.01, last_rate * f))
-
-
-# ---------------------------------------------------------------------------
-# Joint hierarchical model: earns ~ Binomial(N, p),
-# logit p[t,i] = alpha[i] + f(t) + delta * log(N[t]/N[0]).
-# alpha[i] shrunk to PAVA-ordered tier means; f(t) RW2-smoothed.
-# Fitted by alternating penalised weighted least squares on the logit
-# scale, with binomial-style weights w ~ q(1-q) and recency weights.
-# ---------------------------------------------------------------------------
-
-def _pava_nonincreasing(vals):
-    """Isotonic regression: return vals pooled to be non-increasing."""
-    blocks = [[v, 1] for v in vals]
-    i = 0
-    while i < len(blocks) - 1:
-        if blocks[i][0] < blocks[i + 1][0]:
-            tot = blocks[i][0] * blocks[i][1] + blocks[i + 1][0] * blocks[i + 1][1]
-            cnt = blocks[i][1] + blocks[i + 1][1]
-            blocks[i:i + 2] = [[tot / cnt, cnt]]
-            if i > 0:
-                i -= 1
-        else:
-            i += 1
+def trophy_series(points, idx):
+    """(t, rate) pairs for one trophy over the refresh points."""
     out = []
-    for v, c in blocks:
-        out.extend([v] * c)
+    for p in points:
+        rates = p["rates"]
+        if idx < len(rates):
+            r = rates[idx]
+            if r is not None:
+                try:
+                    r = float(r)
+                except (TypeError, ValueError):
+                    continue
+                if 0.0 <= r <= 100.0:
+                    out.append((p["t"], r))
     return out
 
 
-def _solve_linear(A, b):
-    """Dense Gaussian elimination with partial pivoting (small systems)."""
-    n = len(b)
-    M = [row[:] + [b[i]] for i, row in enumerate(A)]
-    for col in range(n):
-        piv = max(range(col, n), key=lambda r: abs(M[r][col]))
-        if abs(M[piv][col]) < 1e-12:
+def ceiling_candidates(last_rate):
+    cands = []
+    for m in (1.15, 1.5, 2.2, 3.5, 7.0, 14.0):
+        c = last_rate * m
+        if c < CEIL:
+            cands.append(c)
+    cands.append(CEIL)
+    out = []
+    for c in cands:
+        if c > last_rate * 1.02 and all(abs(c - d) > 1e-9 for d in out):
+            out.append(c)
+    return out or [CEIL]
+
+
+# ------------------------------------------------------------ curve models
+# Each fit function takes pts = [(t, rate)] and returns a predictor
+# t -> logit at that time. All are deterministic.
+
+def fit_loglin(pts):
+    """Returns a predictor t -> logit, or None."""
+    if not pts:
+        return None
+    last = logit_pct(pts[-1][1])
+    if len(pts) < 2:
+        return lambda t: last
+    xs = [math.log(t) for t, _ in pts]
+    ys = [logit_pct(r) for _, r in pts]
+    fit = wols(xs, ys, recency_weights(pts))
+    if fit is None:
+        return lambda t: last
+    a, b = fit
+    b = max(-1.5, min(4.0, b))
+
+    def pred(t):
+        return a + b * math.log(max(t, 1.0))
+    return pred
+
+
+def _loglog_fit(pts, ceiling):
+    """Weighted OLS fit of logit(rate/C) on log(t); returns
+    (weighted sse, a, b) or None."""
+    xs, ys = [], []
+    for t, r in pts:
+        if r >= ceiling * 0.999:
+            return None
+        p = min(max(r / ceiling, 1e-4), 0.9999)
+        ys.append(math.log(p / (1.0 - p)))
+        xs.append(math.log(t))
+    ws = recency_weights(pts)
+    fit = wols(xs, ys, ws)
+    if fit is None:
+        return None
+    a, b = fit
+    b = max(-1.5, min(6.0, b))
+    sse = 0.0
+    for (t, r), w in zip(pts, ws):
+        pred_p = ceiling / (1.0 + math.exp(-(a + b * math.log(t))))
+        sse += w * (logit_pct(pred_p) - logit_pct(r)) ** 2
+    return (sse, a, b)
+
+
+def fit_loglogistic(pts):
+    if not pts:
+        return None
+    last = logit_pct(pts[-1][1])
+    if len(pts) < 2:
+        return lambda t: last
+    best = None
+    for c in ceiling_candidates(pts[-1][1]):
+        res = _loglog_fit(pts, c)
+        if res is None:
             continue
-        M[col], M[piv] = M[piv], M[col]
-        pv = M[col][col]
+        sse, a, b = res
+        if best is None or sse < best[0]:
+            best = (sse, c, a, b)
+    if best is None:
+        return fit_loglin(pts)
+    _, c, a, b = best
+
+    def pred(t):
+        p = c / (1.0 + math.exp(-(a + b * math.log(max(t, 1.0)))))
+        return logit_pct(p)
+    return pred
+
+
+def fit_weibull(pts):
+    """Two-stage grid: a coarse (k, lam) grid with the ceiling fixed,
+    then two rounds of local refinement (lam steps x1.15, k +-0.15)
+    over (k, lam, ceiling) jointly. The coarse lam grid uses x1.5
+    steps so the refinement window always covers the coarse winner's
+    neighbourhood."""
+    if not pts:
+        return None
+    last = logit_pct(pts[-1][1])
+    if len(pts) < 2:
+        return lambda t: last
+    last_rate = pts[-1][1]
+    ys = [logit_pct(r) for _, r in pts]
+    lts = [math.log(t) for t, _ in pts]
+    ws = recency_weights(pts)
+
+    def sse(c, k, lam):
+        log_lam = math.log(lam)
+        tot = 0.0
+        for lt, y, w in zip(lts, ys, ws):
+            try:
+                frac = 1.0 - math.exp(-math.exp(k * (lt - log_lam)))
+            except OverflowError:
+                frac = 1.0
+            p = c * frac
+            tot += w * (logit_pct(p) - y) ** 2
+        return tot
+
+    ks = (0.4, 0.6, 0.9, 1.3, 1.9, 2.8)
+    lams = []
+    lam = 4.0
+    while lam <= 1200.0:
+        lams.append(lam)
+        lam *= 1.5
+    c0 = min(CEIL, last_rate * 2.2)
+    best = None  # (sse, ceiling, k, lam)
+    for k in ks:
+        for lm in lams:
+            v = sse(c0, k, lm)
+            if best is None or v < best[0]:
+                best = (v, c0, k, lm)
+    ceilings = ceiling_candidates(last_rate)
+    for rnd in range(2):
+        _, bc, bk, blam = best
+        cand_lams = [blam / (1.15 ** 2), blam / 1.15, blam,
+                     blam * 1.15, blam * (1.15 ** 2)]
+        cand_ks = [bk - 0.15, bk - 0.075, bk, bk + 0.075, bk + 0.15]
+        cand_cs = ceilings if rnd == 0 else [bc * 0.85, bc,
+                                             min(CEIL, bc * 1.18)]
+        for c in cand_cs:
+            if c <= last_rate * 1.02:
+                continue
+            for k in cand_ks:
+                if k <= 0.05:
+                    continue
+                for lm in cand_lams:
+                    v = sse(c, k, lm)
+                    if v < best[0]:
+                        best = (v, c, k, lm)
+    _, c, k, lam = best
+
+    def pred(t):
+        try:
+            frac = 1.0 - math.exp(-((max(t, 1.0) / lam) ** k))
+        except OverflowError:
+            frac = 1.0
+        return logit_pct(c * frac)
+    return pred
+
+
+MODEL_FITS = (("loglin", fit_loglin),
+              ("loglog", fit_loglogistic),
+              ("weibull", fit_weibull))
+
+
+def fit_all_models(pts):
+    """{name: predictor t -> logit} for every curve model."""
+    fallback = logit_pct(pts[-1][1]) if pts else 0.0
+    out = {}
+    for name, fn in MODEL_FITS:
+        try:
+            f = fn(pts)
+        except Exception:
+            f = None
+        if f is None:
+            f = (lambda v: (lambda t: v))(fallback)
+        out[name] = f
+    return out
+
+
+def predict_all(fits, t):
+    out = {}
+    for name, f in fits.items():
+        try:
+            v = f(t)
+        except Exception:
+            v = None
+        if v is None or not math.isfinite(v):
+            v = 0.0
+        out[name] = v
+    return out
+
+
+def rolling_origin_weights(pts):
+    """Weights from a rolling-origin backtest inside the history.
+
+    Fit each model on pts[:j] and score it on pts[j] for the last few
+    origins j. Weight is inverse mean squared logit error (floored and
+    sharpened). Equal weights when there is nothing to backtest on.
+    Returns (weights, best_origin_rmse): the RMSE of the best single
+    model at the origins, an honest out-of-sample error scale.
+    """
+    n = len(pts)
+    if n < 3:
+        return ({name: 1.0 / len(MODEL_FITS) for name, _ in MODEL_FITS},
+                None)
+    errs = {name: [] for name, _ in MODEL_FITS}
+    origins = [j for j in (n - 3, n - 2) if 2 <= j < n]
+    if not origins:
+        origins = [n - 1]
+    for j in origins:
+        train = pts[:j]
+        t_next, r_next = pts[j]
+        y_next = logit_pct(r_next)
+        fits = fit_all_models(train)
+        preds = predict_all(fits, t_next)
+        for name in errs:
+            errs[name].append((preds[name] - y_next) ** 2)
+    weights = {}
+    for name in errs:
+        mse = sum(errs[name]) / len(errs[name]) if errs[name] else 1.0
+        weights[name] = 1.0 / (max(mse, 0.005) + 0.005)
+    tot = sum(weights.values())
+    weights = {name: w / tot for name, w in weights.items()}
+    # Cap any single weight at 0.7; redistribute the excess evenly.
+    for name in weights:
+        if weights[name] > 0.7:
+            excess = weights[name] - 0.7
+            weights[name] = 0.7
+            others = [o for o in weights if o != name]
+            for o in others:
+                weights[o] += excess / len(others)
+    best_rmse = min(
+        math.sqrt(sum(v) / len(v)) for v in errs.values() if v)
+    return weights, best_rmse
+
+
+def ensemble_predict(fits, t_target, weights=None, equal=False):
+    """(weighted median logit, per-model logits, weights)."""
+    preds = predict_all(fits, t_target)
+    if equal or weights is None:
+        w = {name: 1.0 / len(MODEL_FITS) for name, _ in MODEL_FITS}
+    else:
+        w = weights
+    med = sum(w[name] * preds[name] for name, _ in MODEL_FITS)
+    return med, preds, w
+
+
+def ensemble_spread(fits, pts, t_target, weights, horizon_days,
+                    pooled_sigma, origin_rmse=None):
+    """Spread from the median residual of the weighted ensemble.
+
+    The scale is the larger of the in-sample residual median and the
+    honest rolling-origin error, so a flexible fit cannot claim a
+    spuriously narrow spread; it grows log-wise with the horizon and
+    is capped at 0.9. Model disagreement widens it a little.
+    """
+    if len(pts) < 2:
+        return min(0.9, 0.45 + 0.10 * math.log1p(horizon_days))
+    resids = []
+    for t, r in pts:
+        med, _, _ = ensemble_predict(fits, t, weights)
+        resids.append(abs(med - logit_pct(r)))
+    sigma = median(resids) if resids else pooled_sigma
+    if origin_rmse is not None:
+        sigma = max(sigma, 0.6 * origin_rmse)
+    if len(pts) < 3:
+        sigma = pooled_sigma
+    sigma = max(sigma, 0.10)
+    _, preds, _ = ensemble_predict(fits, t_target, weights)
+    disagree = max(preds.values()) - min(preds.values())
+    growth = 1.0 + 0.35 * math.log1p(horizon_days)
+    s = math.sqrt((sigma * growth) ** 2 + (0.35 * disagree) ** 2)
+    return min(0.9, max(0.10, s))
+
+
+# ------------------------------------------------------------ dilution prior
+
+def dilution_multiplier(points):
+    """Median jump of players-tracked across refresh points, else 5x."""
+    jumps = []
+    prev_n = None
+    for p in points:
+        n = p["n"]
+        if n is None or n <= 0:
+            continue
+        if prev_n is not None and prev_n > 0 and n > prev_n:
+            jumps.append(n / prev_n)
+        prev_n = n
+    if jumps:
+        return median(jumps)
+    return 5.0
+
+
+def dilution_forecast(case, points, t_target, horizon_days):
+    """Flat-history forecast: (median logit, spread) per trophy index.
+
+    New players (the assumed extra (m-1)*N of them) are taken to hold
+    almost no trophies: the trophy at 100% stays 100% (everyone holds
+    it), the next three trophies by rate keep a 10% new-player earn
+    rate, everything else gets none.
+    """
+    last = points[-1] if points else None
+    n0 = last["n"] if last and last.get("n") else 638.0
+    mult = dilution_multiplier(points)
+    n1 = mult * n0
+    trophies = case.get("trophies") or []
+    last_rates = last["rates"] if last else []
+    rates = []
+    for i, tr in enumerate(trophies):
+        r = last_rates[i] if i < len(last_rates) else None
+        if r is None:
+            r = TIER_PRIOR.get(tr.get("tier"), 3.0)
+        rates.append(float(r))
+    order = sorted(range(len(rates)), key=lambda i: -rates[i])
+    earn_new = [0.0] * len(rates)
+    seen_early = 0
+    for i in order:
+        if rates[i] >= 99.99:
+            earn_new[i] = 1.0
+        elif seen_early < 3:
+            earn_new[i] = 0.10 * rates[i] / 100.0
+            seen_early += 1
+    spread = min(0.9, 0.50 + 0.10 * math.log1p(horizon_days))
+    out = {}
+    for i, tr in enumerate(trophies):
+        e_old = rates[i] / 100.0 * n0
+        e_new = earn_new[i] * (n1 - n0)
+        p = 100.0 * (e_old + e_new) / n1 if n1 > 0 else rates[i]
+        out[i] = (logit_pct(p), spread)
+    return out
+
+
+# ------------------------------------------------------- joint model (gated)
+
+def _pava_increasing(vals, weights):
+    """Isotonic regression (non-decreasing) by the pool-adjacent-violators
+    algorithm. Returns the fitted values."""
+    n = len(vals)
+    levels = [[v, w, 1] for v, w in zip(vals, weights)]
+    i = 0
+    stack = []
+    for v, w, c in levels:
+        cur = [v, w, c]
+        while stack and stack[-1][0] > cur[0]:
+            pv, pw, pc = stack.pop()
+            tot_w = pw + cur[1]
+            cur = [(pv * pw + cur[0] * cur[1]) / tot_w, tot_w,
+                   pc + cur[2]]
+        stack.append(cur)
+    out = []
+    for v, w, c in stack:
+        out.extend([v] * c)
+    return out[:n]
+
+
+def _solve_linear(a, b):
+    """Gaussian elimination with partial pivoting (small dense system)."""
+    n = len(b)
+    m = [row[:] + [b[i]] for i, row in enumerate(a)]
+    for col in range(n):
+        piv = max(range(col, n), key=lambda r: abs(m[r][col]))
+        if abs(m[piv][col]) < 1e-12:
+            continue
+        m[col], m[piv] = m[piv], m[col]
+        pv = m[col][col]
         for r in range(n):
-            if r != col and M[r][col] != 0.0:
-                fac = M[r][col] / pv
+            if r != col and m[r][col] != 0.0:
+                f = m[r][col] / pv
                 for c in range(col, n + 1):
-                    M[r][c] -= fac * M[col][c]
-    return [M[i][n] / M[i][i] if abs(M[i][i]) > 1e-12 else 0.0
+                    m[r][c] -= f * m[col][c]
+    return [m[i][n] / m[i][i] if abs(m[i][i]) > 1e-12 else 0.0
             for i in range(n)]
 
 
-def joint_fit(case, points, lam_rw2=8.0, lam_alpha=2.0, lam_delta=30.0):
-    """Fit the joint model on refresh points up to the case at hand.
+def _rw2_smooth(raw, wts, lam):
+    """Smooth a series with a second-difference (RW2) penalty."""
+    n = len(raw)
+    if n < 3:
+        return list(raw)
+    a = [[0.0] * n for _ in range(n)]
+    b = [0.0] * n
+    for i in range(n):
+        a[i][i] += wts[i]
+        b[i] += wts[i] * raw[i]
+    for i in range(n - 2):
+        for u, cu in ((i, 1.0), (i + 1, -2.0), (i + 2, 1.0)):
+            for v, cv in ((i, 1.0), (i + 1, -2.0), (i + 2, 1.0)):
+                a[u][v] += lam * cu * cv
+    return _solve_linear(a, b)
 
-    Returns a dict with per-trophy intercepts, the shared trend f at
-    each refresh time, the dilution coefficient, tier means and the
-    residual scale, or None when the history cannot support it.
+
+def joint_fit(points, trophies, thin=20):
+    """Hierarchical binomial joint model.
+
+    earns ~ Binomial(N, p), logit p = alpha[i] + f(t) + delta*log(N/N0).
+    alpha[i] shrunk to the PAVA-ordered tier mean (platinum < gold <
+    silver < bronze in logit), f(t) RW2-smoothed, delta shrunk to 0.
+    Returns a predictor (t_target, n_target) -> {trophy idx: logit},
+    or None when the history is too thin.
     """
-    trophies = case["trophies"]
-    J = len(points)
-    I = len(trophies)
-    if J < 4 or I < 2:
+    pts = points
+    if len(pts) > thin:
+        step = len(pts) / float(thin)
+        keep = [pts[int(i * step)] for i in range(thin)]
+        if keep[-1] is not pts[-1]:
+            keep.append(pts[-1])
+        pts = keep
+    if len(pts) < 4:
         return None
-    if J > 40:
-        # Evenly thin to 40 refresh points (keep first/last): the joint
-        # fit solves a JxJ system per sweep, so an unthinned long final
-        # history would blow the 8 s budget for no material gain.
-        idx = sorted({round(i * (J - 1) / 39) for i in range(40)})
-        points = [points[i] for i in idx]
-        J = len(points)
-    times = [hours_since_release(r["slot"]) for r in points]
-    n0 = points[0].get("players_tracked") or 1
-    dlog = []
-    for r in points:
-        n = r.get("players_tracked") or n0
-        dlog.append(math.log(max(1.0, n) / max(1.0, n0)))
-    Y = [[None] * J for _ in range(I)]
-    W = [[0.0] * J for _ in range(I)]
-    now = times[-1]
-    for i in range(I):
-        for j, read in enumerate(points):
-            rates = read.get("rates") or []
-            if i >= len(rates) or rates[i] is None:
+    n_tr = len(trophies)
+    n0 = pts[0]["n"] or 638.0
+    if not n0 or n0 <= 0:
+        n0 = 638.0
+    # Smoothed empirical logits and binomial weights.
+    y = []   # y[i][j]
+    w = []
+    for i in range(n_tr):
+        yi, wi = [], []
+        for p in pts:
+            rates = p["rates"]
+            r = rates[i] if i < len(rates) else None
+            n = p["n"] or n0
+            if r is None or n <= 0:
+                yi.append(None)
+                wi.append(0.0)
                 continue
-            q = rates[i] / 100.0
-            Y[i][j] = logit(rates[i])
-            rec = 0.5 ** max(0.0, (now - times[j]) / 24.0)
-            W[i][j] = rec * min(0.25, max(0.002, q * (1.0 - q))) / 0.25
-    alpha = []
-    for i in range(I):
-        vals = [Y[i][j] for j in range(J) if Y[i][j] is not None]
-        alpha.append(vals[-1] if vals else logit(1.0))
-    f = [0.0] * J
+            e = min(max(r / 100.0 * n, 0.0), n)
+            pc = (e + 0.5) / (n + 1.0)
+            yi.append(math.log(pc / (1.0 - pc)))
+            wi.append(n * pc * (1.0 - pc))
+        y.append(yi)
+        w.append(wi)
+    if sum(sum(row) for row in w) <= 0:
+        return None
+    tiers = [tr.get("tier", "bronze") for tr in trophies]
+    log_n = []
+    for p in pts:
+        n = p["n"] or n0
+        log_n.append(math.log(max(n, 1.0) / n0))
+    times = [p["t"] for p in pts]
+    alpha = [0.0] * n_tr
+    for i in range(n_tr):
+        num = sum(wi * yi for wi, yi in zip(w[i], y[i]) if yi is not None)
+        den = sum(wi for wi, yi in zip(w[i], y[i]) if yi is not None)
+        alpha[i] = num / den if den > 0 else logit_pct(
+            TIER_PRIOR.get(tiers[i], 3.0))
+    f = [0.0] * len(pts)
     delta = 0.0
-    tier_of = [TIER_IDX.get(t.get("tier"), 3) for t in trophies]
-    mu = [0.0] * 4
-    for _sweep in range(12):
-        # Tier means, ordered rarest-first non-decreasing in logit
-        # (platinum lowest, bronze highest): PAVA on the negated means.
+    for _ in range(12):
+        # alpha[i]: weighted mean of residuals, shrunk to tier mean.
         raw = []
-        for k in range(4):
-            vals = [alpha[i] for i in range(I) if tier_of[i] == k]
-            raw.append(sum(vals) / len(vals) if vals else 0.0)
-        mu = [-v for v in _pava_nonincreasing([-v for v in raw])]
-        for i in range(I):
-            num = lam_alpha * mu[tier_of[i]]
-            den = lam_alpha
-            for j in range(J):
-                if Y[i][j] is None:
+        for i in range(n_tr):
+            num = 0.0
+            den = 0.0
+            for j in range(len(pts)):
+                if y[i][j] is None:
                     continue
-                num += W[i][j] * (Y[i][j] - f[j] - delta * dlog[j])
-                den += W[i][j]
-            alpha[i] = num / den if den > 0 else mu[tier_of[i]]
-        num = 0.0
-        den = lam_delta
-        for i in range(I):
-            for j in range(J):
-                if Y[i][j] is None:
+                num += w[i][j] * (y[i][j] - f[j] - delta * log_n[j])
+                den += w[i][j]
+            raw.append(num / den if den > 0 else alpha[i])
+        tier_mean = {}
+        for tier in TIER_ORDER:
+            idxs = [i for i in range(n_tr) if tiers[i] == tier]
+            if idxs:
+                tier_mean[tier] = sum(raw[i] for i in idxs) / len(idxs)
+        present = [t for t in TIER_ORDER if t in tier_mean]
+        if len(present) >= 2:
+            vals = [tier_mean[t] for t in present]
+            wts = [sum(1 for i in range(n_tr) if tiers[i] == t)
+                   for t in present]
+            fitted = _pava_increasing(vals, wts)
+            for t, v in zip(present, fitted):
+                tier_mean[t] = v
+        for i in range(n_tr):
+            tm = tier_mean.get(tiers[i], raw[i])
+            den = sum(w[i][j] for j in range(len(pts))
+                      if y[i][j] is not None)
+            alpha[i] = (den * raw[i] + 60.0 * tm) / (den + 60.0)
+        # f[j]: weighted mean of residuals, RW2-smoothed.
+        raw_f = []
+        w_f = []
+        for j in range(len(pts)):
+            num = 0.0
+            den = 0.0
+            for i in range(n_tr):
+                if y[i][j] is None:
                     continue
-                r = Y[i][j] - alpha[i] - f[j]
-                num += W[i][j] * r * dlog[j]
-                den += W[i][j] * dlog[j] * dlog[j]
-        delta = num / den if den > 0 else 0.0
-        delta = max(-1.5, min(1.5, delta))
-        A = [[0.0] * J for _ in range(J)]
-        b = [0.0] * J
-        for j in range(J):
-            sw = 0.0
-            sb = 0.0
-            for i in range(I):
-                if Y[i][j] is None:
-                    continue
-                sw += W[i][j]
-                sb += W[i][j] * (Y[i][j] - alpha[i] - delta * dlog[j])
-            A[j][j] += sw + 1e-6
-            b[j] += sb
-        for j in range(1, J - 1):
-            idx = [j - 1, j, j + 1]
-            co = [1.0, -2.0, 1.0]
-            for x in range(3):
-                for y in range(3):
-                    A[idx[x]][idx[y]] += lam_rw2 * co[x] * co[y]
-        f_new = _solve_linear(A, b)
-        shift = sum(f_new) / J
-        f = [v - shift for v in f_new]
-        alpha = [a + shift for a in alpha]
-    res = []
-    for i in range(I):
-        for j in range(J):
-            if Y[i][j] is None:
-                continue
-            res.append(Y[i][j] - alpha[i] - f[j] - delta * dlog[j])
-    if res:
-        res.sort()
-        med = res[len(res) // 2]
-        devs = sorted(abs(r - med) for r in res)
-        sigma_res = 1.4826 * devs[len(devs) // 2]
-    else:
-        sigma_res = 0.3
-    return {"alpha": alpha, "f": f, "times": times, "delta": delta,
-            "mu": mu, "sigma_res": max(0.05, sigma_res),
-            "dlog": dlog, "n0": n0}
-
-
-def joint_forecast_median(jfit, case, points, target_t):
-    """Per-trophy median logit at the target from a fitted joint model.
-
-    The shared trend is extrapolated with a damped slope (RW2 keeps
-    going straight; damping keeps a 4.5-day extrapolation honest), and
-    the tracked count at the target comes from a saturating N(t) fit.
-    """
-    times = jfit["times"]
-    f = jfit["f"]
-    J = len(times)
-    if J >= 3:
-        slope = (f[-1] - f[-3]) / max(1.0, times[-1] - times[-3])
-    elif J >= 2:
-        slope = (f[-1] - f[-2]) / max(1.0, times[-1] - times[-2])
-    else:
-        slope = 0.0
-    horizon = max(0.0, target_t - times[-1])
-    damp = math.exp(-horizon / 96.0)
-    f_t = f[-1] + slope * horizon * damp
-    f_t = max(f[-1] - 1.5, min(f[-1] + 1.5, f_t))
-    ns = [(times[j], points[j].get("players_tracked") or 0) for j in range(J)]
-    best = None
-    for tau in (12.0, 24.0, 48.0, 96.0, 192.0):
-        n_first = ns[0][1] or 0
+                num += w[i][j] * (y[i][j] - alpha[i] - delta * log_n[j])
+                den += w[i][j]
+            raw_f.append(num / den if den > 0 else f[j])
+            w_f.append(max(den, 1.0))
+        f = _rw2_smooth(raw_f, w_f, 2.0)
+        # delta: weighted regression of residuals on log(N/N0), shrunk.
         num = 0.0
         den = 0.0
-        for t, n in ns:
-            x = max(0.0, t) / (max(0.0, t) + tau) if t > 0 else 0.0
-            num += x * (n - n_first)
-            den += x * x
-        if den <= 1e-12:
-            continue
-        ninf = num / den
-        if ninf <= 0:
-            continue
-        sse = 0.0
-        for t, n in ns:
-            x = max(0.0, t) / (max(0.0, t) + tau) if t > 0 else 0.0
-            sse += (n_first + ninf * x - n) ** 2
-        if best is None or sse < best[0]:
-            best = (sse, ninf, tau, n_first)
-    if best is not None:
-        _, ninf, tau, n_first = best
-        x = max(0.0, target_t) / (max(0.0, target_t) + tau)
-        n_t = n_first + ninf * x
-        d_t = math.log(max(1.0, n_t) / max(1.0, jfit["n0"]))
-    else:
-        d_t = jfit["dlog"][-1]
-    d_t = max(jfit["dlog"][-1], min(jfit["dlog"][-1] + 2.0, d_t))
-    return [jfit["alpha"][i] + f_t + jfit["delta"] * d_t
-            for i in range(len(case["trophies"]))]
-
-
-# ---------------------------------------------------------------------------
-# Pinball loss and rolling-origin backtests.
-# ---------------------------------------------------------------------------
-
-def pinball_loss(actual_pct, quantiles_pct):
-    """Mean pinball loss over the five levels, on the logit scale."""
-    y = logit(actual_pct)
-    total = 0.0
-    for tau, q in zip(LEVELS, quantiles_pct):
-        d = y - logit(q)
-        total += 2.0 * max(tau * d, (tau - 1.0) * d)
-    return total / len(LEVELS)
-
-
-def _origin_reads(points, horizon_h):
-    """Up to 8 origin refresh points, spread over the history."""
-    if len(points) < 5:
-        return []
-    if len(points) > 12:
-        step = (len(points) - 4) / 8.0
-        idx = sorted({min(len(points) - 2, 3 + int(i * step))
-                      for i in range(8)})
-        return [points[i] for i in idx]
-    return points[3:-1]
-
-
-def backtest(case, points, target_t, horizon_h):
-    """Rolling-origin evaluation of the curve ensemble on refresh points.
-
-    Each curve is fit on points up to an origin and scored (pinball,
-    spread 0.5 logit) against the first later point at least eval_h
-    ahead, or the last point. Returns (weights, sigma_eval, eval_h):
-    weights per curve pooled over trophies, sigma_eval the robust
-    residual scale of the weighted ensemble median. Empty when the
-    history cannot support it.
-    """
-    if len(points) < 4:
-        return {}, None, None
-    origins = _origin_reads(points, horizon_h)
-    trophies = case["trophies"]
-    eval_h = min(horizon_h, 24.0)
-    losses = {}
-    trials = []
-    for origin in origins:
-        o_t = hours_since_release(origin["slot"])
-        upto = [r for r in points if hours_since_release(r["slot"]) <= o_t]
-        later = [r for r in points if hours_since_release(r["slot"]) > o_t]
-        if not later:
-            continue
-        eval_read = None
-        for r in later:
-            if hours_since_release(r["slot"]) - o_t >= eval_h:
-                eval_read = r
-                break
-        if eval_read is None:
-            eval_read = later[-1]
-        e_t = hours_since_release(eval_read["slot"])
-        eval_rates = eval_read.get("rates") or []
-        for idx, trophy in enumerate(trophies):
-            if idx >= len(eval_rates):
-                continue
-            actual = eval_rates[idx]
-            if actual is None:
-                continue
-            series = trophy_series(case, upto, idx)
-            if len(series) < 2:
-                continue
-            fits = _fit_all_models(series, e_t)
-            medians = [v for v in fits.values() if v is not None]
-            if not medians:
-                continue
-            for name, med in fits.items():
-                if med is None:
+        for i in range(n_tr):
+            for j in range(len(pts)):
+                if y[i][j] is None:
                     continue
-                q = [inv_logit(logit(med) + z * 0.5) for z in Z]
-                losses.setdefault(name, []).append(pinball_loss(actual, q))
-            trials.append((actual, fits))
-    if not losses or not trials:
-        return {}, None, None
-    mean_loss = {k: sum(v) / len(v) for k, v in losses.items()}
-    best = min(mean_loss.values())
-    weights = {}
-    total = 0.0
-    for k, v in mean_loss.items():
-        w = 1.0 / max(0.05, (v / best) ** 2)
-        weights[k] = w
-        total += w
-    weights = {k: w / total for k, w in weights.items()}
-    residuals = []
-    for actual, fits in trials:
-        wsum = sum(weights.get(n, 0.0) for n in fits if fits[n] is not None)
-        if wsum <= 0:
-            continue
-        avg = sum(weights.get(n, 0.0) * logit(m)
-                  for n, m in fits.items() if m is not None) / wsum
-        residuals.append(logit(actual) - avg)
-    if not residuals:
-        return weights, None, eval_h
-    residuals.sort()
-    med = residuals[len(residuals) // 2]
-    devs = sorted(abs(r - med) for r in residuals)
-    mad = devs[len(devs) // 2]
-    sigma_eval = 1.4826 * mad
-    return weights, sigma_eval, eval_h
+                r = y[i][j] - alpha[i] - f[j]
+                num += w[i][j] * log_n[j] * r
+                den += w[i][j] * log_n[j] ** 2
+        delta = num / (den + 200.0) if den > 0 else 0.0
+        delta = max(-1.0, min(1.0, delta))
+    # Extrapolation helpers.
+    def predict(t_target, n_target):
+        # f: extend the last slope, damped by half.
+        if len(f) >= 3:
+            slope = (f[-1] - f[-3]) / max(times[-1] - times[-3], 1e-9)
+        elif len(f) >= 2:
+            slope = (f[-1] - f[-2]) / max(times[-1] - times[-2], 1e-9)
+        else:
+            slope = 0.0
+        slope = max(-0.05, min(0.05, slope))
+        f_t = f[-1] + 0.5 * slope * max(t_target - times[-1], 0.0)
+        ln_n = math.log(max(n_target, 1.0) / n0)
+        return {i: alpha[i] + f_t + delta * ln_n for i in range(n_tr)}
+    return predict
 
 
-def joint_cv_weight(case, points, horizon_h, curve_weights):
-    """The joint model's blend weight, earned (or not) by CV.
+def _extrapolated_n(points, horizon_days):
+    """Damped log-linear extrapolation of players-tracked."""
+    ns = [(p["t"], p["n"]) for p in points if p["n"] and p["n"] > 0]
+    if len(ns) < 2:
+        return (points[-1]["n"] or 638.0) if points else 638.0
+    xs = [t for t, _ in ns]
+    ys = [math.log(n) for _, n in ns]
+    fit = ols(xs, ys)
+    if fit is None:
+        return ns[-1][1]
+    a, b = fit
+    b = max(0.0, min(0.05, b))
+    t_last = ns[-1][0]
+    horizon_h = horizon_days * 24.0
+    return math.exp(a + b * (t_last + 0.5 * horizon_h))
 
-    Same origins as backtest(), but the joint model and the
-    backtest-WEIGHTED curve ensemble are scored head to head at the
-    longest horizon the history supports. The comparison must use the
-    weighted ensemble — the equal-weight average is far weaker and
-    would let the joint model in on worlds where it still loses to the
-    forecast actually shipped. The joint model enters only if it beats
-    the weighted curves by at least 10% there, with weight
-    proportional to the win and capped at 0.30; otherwise the weight
-    is exactly 0. Returns 0.0 when the history cannot support the
-    comparison.
-    """
+
+def _cv_loss_ensemble(points, trophies, cut):
+    """Median-only logit MAE of the weighted ensemble trained on the
+    points before `cut`, predicting the first two points at/after it."""
+    train = [p for p in points if p["t"] < cut]
+    test = [p for p in points if p["t"] >= cut]
+    if len(train) < 3 or not test:
+        return None
+    errs = []
+    for tp in test[:2]:
+        for i in range(len(trophies)):
+            pts = trophy_series(train, i)
+            if len(pts) < 2:
+                continue
+            rates = tp["rates"]
+            if i >= len(rates) or rates[i] is None:
+                continue
+            w, _ = rolling_origin_weights(pts)
+            fits = fit_all_models(pts)
+            med, _, _ = ensemble_predict(fits, tp["t"], w)
+            errs.append(abs(med - logit_pct(rates[i])))
+    return sum(errs) / len(errs) if errs else None
+
+
+def _cv_loss_joint(points, trophies, cut):
+    train = [p for p in points if p["t"] < cut]
+    test = [p for p in points if p["t"] >= cut]
+    if len(train) < 4 or not test:
+        return None
+    pred_fn = joint_fit(train, trophies)
+    if pred_fn is None:
+        return None
+    errs = []
+    for tp in test[:2]:
+        n_t = tp["n"] or (train[-1]["n"] or 638.0)
+        preds = pred_fn(tp["t"], n_t)
+        for i in range(len(trophies)):
+            rates = tp["rates"]
+            if i >= len(rates) or rates[i] is None:
+                continue
+            errs.append(abs(preds[i] - logit_pct(rates[i])))
+    return sum(errs) / len(errs) if errs else None
+
+
+def joint_gate_weight(points, trophies, horizon_days):
+    """0.30 if the joint model's expanding-window CV beats the weighted
+    curve ensemble by >=10%, else exactly 0.0."""
     if len(points) < 6:
         return 0.0
-    origins = _origin_reads(points, horizon_h)
-    if len(origins) < 2:
+    ts = [p["t"] for p in points]
+    span = ts[-1] - ts[0]
+    if span <= 0:
         return 0.0
-    eval_h = min(horizon_h, 24.0)
-    lj, lc = [], []
-    for origin in origins:
-        o_t = hours_since_release(origin["slot"])
-        upto = [r for r in points if hours_since_release(r["slot"]) <= o_t]
-        later = [r for r in points if hours_since_release(r["slot"]) > o_t]
-        if not later:
-            continue
-        eval_read = None
-        for r in later:
-            if hours_since_release(r["slot"]) - o_t >= eval_h:
-                eval_read = r
-                break
-        if eval_read is None:
-            eval_read = later[-1]
-        e_t = hours_since_release(eval_read["slot"])
-        eval_rates = eval_read.get("rates") or []
-        try:
-            jf = joint_fit(case, upto)
-            jmed = joint_forecast_median(jf, case, upto, e_t) if jf else None
-        except Exception:
-            jmed = None
-        if jmed is None:
-            continue
-        for idx in range(len(case["trophies"])):
-            if idx >= len(eval_rates) or eval_rates[idx] is None:
-                continue
-            actual = eval_rates[idx]
-            series = trophy_series(case, upto, idx)
-            if len(series) < 2:
-                continue
-            fits = _fit_all_models(series, e_t)
-            wsum = sum(curve_weights.get(n, 0.0) for n, v in fits.items()
-                       if v is not None)
-            if wsum <= 0:
-                continue
-            c_logit = sum(curve_weights.get(n, 0.0) * logit(v)
-                          for n, v in fits.items() if v is not None) / wsum
-            qj = [inv_logit(jmed[idx] + z * 0.5) for z in Z]
-            qc = [inv_logit(c_logit + z * 0.5) for z in Z]
-            lj.append(pinball_loss(actual, qj))
-            lc.append(pinball_loss(actual, qc))
-    if len(lj) < 10:
+    cut = ts[0] + 0.65 * span
+    e = _cv_loss_ensemble(points, trophies, cut)
+    j = _cv_loss_joint(points, trophies, cut)
+    if e is None or j is None or e <= 0:
         return 0.0
-    mj = sum(lj) / len(lj)
-    mc = sum(lc) / len(lc)
-    if mj >= 0.9 * mc:
-        return 0.0
-    return max(0.0, min(0.30, 0.30 * (mc - mj) / max(0.05, mc)))
+    if j < 0.90 * e:
+        return 0.30
+    return 0.0
 
 
-# ---------------------------------------------------------------------------
-# Forecast assembly.
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------- forecast
 
-def forecast_trophy(case, points, idx, trophy, weights, target_t,
-                    horizon_h, sigma_floor, joint_median, w_joint):
-    """(median_pct, sigma_logit) for one trophy."""
-    series = trophy_series(case, points, idx)
-    last_rate = series[-1][1] if series else None
-    if last_rate is None:
-        return 1.0, 1.2
-    if last_rate >= 99.99:
-        return 100.0, 0.05
-    if len(points) < 2 or series_moved(series) < 0.02:
-        return dilution_median(last_rate, trophy,
-                               n_multiplier_prior(points)), max(1.0, sigma_floor)
-    fits = _fit_all_models(series, target_t)
-    medians = [(weights.get(name, 0.0), med)
-               for name, med in fits.items() if med is not None]
-    if not medians:
-        return last_rate, sigma_floor
-    wsum = sum(w for w, _ in medians)
-    avg_logit = sum(w * logit(m) for w, m in medians) / wsum
-    if joint_median is not None and w_joint > 0.0:
-        avg_logit = (1.0 - w_joint) * avg_logit + w_joint * joint_median[idx]
-    median = inv_logit(avg_logit)
-    spread_members = 0.0
-    if len(medians) > 1:
-        var = sum(w * (logit(m) - avg_logit) ** 2 for w, m in medians) / wsum
-        spread_members = math.sqrt(max(0.0, var))
-    sigma = math.sqrt(sigma_floor ** 2 + spread_members ** 2)
-    return median, sigma
+def forecast_case(case, joint_weight_override=None, equal_weights=False):
+    """Returns the list of {"id": n, "q": [q05..q95]} rows for one case.
 
-
-def forecast_case(case):
-    points = refresh_points(case)
-    target_t = hours_since_release(case["target"])
-    at_t = hours_since_release(case["at"])
-    horizon_h = max(0.5, (target_t - at_t))
-    horizon_d = horizon_h / 24.0
-    weights, sigma_eval, eval_h = backtest(case, points, target_t, horizon_h)
-    if not weights:
-        weights = {"loglinear": 0.35, "loglogistic": 0.35, "weibull": 0.3}
-    w_joint = 0.0
-    joint_median = None
-    if len(points) >= 6:
-        try:
-            w_joint = joint_cv_weight(case, points, horizon_h, weights)
-            if w_joint > 0.0:
-                jf = joint_fit(case, points)
-                if jf is not None:
-                    joint_median = joint_forecast_median(jf, case, points,
-                                                          target_t)
-        except Exception:
-            w_joint = 0.0
-            joint_median = None
-    if sigma_eval is None:
-        sigma_floor = 0.9 * (min(horizon_d, 4.0) / 0.0625) ** 0.25
-        sigma_floor = min(sigma_floor, 1.6)
-    else:
-        ratio = max(1.0, horizon_h / max(eval_h, 1.0))
-        grow = 1.0 + 0.10 * math.log2(ratio)
-        sigma_floor = min(sigma_eval * min(grow, 1.2), 0.9)
-        sigma_floor = max(sigma_floor, 0.25)
+    joint_weight_override: None = use the CV gate; a float forces that
+    blend weight (test/ablation use only). equal_weights: use the
+    equal-weight curve ensemble instead of the backtest weights.
+    """
+    trophies = case.get("trophies") or []
+    points, t_target, horizon_days, _ = refresh_points(case)
     rows = []
-    for idx, trophy in enumerate(case["trophies"]):
-        median, sigma = forecast_trophy(case, points, idx, trophy, weights,
-                                        target_t, horizon_h, sigma_floor,
-                                        joint_median, w_joint)
-        sigma = max(0.05, min(2.0, sigma))
+    if not points:
+        # No history at all: tier priors with a wide spread.
+        for tr in trophies:
+            m = logit_pct(TIER_PRIOR.get(tr.get("tier"), 3.0))
+            rows.append((tr.get("id"), m, 0.9))
+    elif len(points) == 1:
+        prior = dilution_forecast(case, points, t_target, horizon_days)
+        for i, tr in enumerate(trophies):
+            m, s = prior[i]
+            rows.append((tr.get("id"), m, s))
+    else:
+        # Thin very long histories for the curve fits (18 refresh
+        # points already pin down a 3-parameter curve).
+        fit_points = points
+        if len(points) > 18:
+            step = len(points) / 18.0
+            fit_points = [points[int(k * step)] for k in range(18)]
+            if fit_points[-1] is not points[-1]:
+                fit_points.append(points[-1])
+        # Pooled residual scale across trophies (for thin series).
+        pooled_res = []
+        pooled_origin = []
+        per_trophy = {}
+        for i, tr in enumerate(trophies):
+            pts = trophy_series(fit_points, i)
+            if len(pts) < 2:
+                continue
+            fits = fit_all_models(pts)
+            w, origin_rmse = rolling_origin_weights(pts)
+            for t, r in pts:
+                med, _, _ = ensemble_predict(fits, t, w)
+                pooled_res.append(abs(med - logit_pct(r)))
+            if origin_rmse is not None:
+                pooled_origin.append(origin_rmse)
+            per_trophy[i] = (pts, fits, w, origin_rmse)
+        pooled_sigma = median(pooled_res) if pooled_res else 0.15
+        if pooled_origin:
+            pooled_sigma = max(pooled_sigma,
+                               0.6 * median(pooled_origin))
+        # Joint model, gated by expanding-window CV.
+        if joint_weight_override is not None:
+            w_joint = joint_weight_override
+        else:
+            w_joint = joint_gate_weight(points, trophies, horizon_days)
+        joint_pred = None
+        if w_joint and w_joint > 0.0:
+            fn = joint_fit(points, trophies)
+            if fn is not None:
+                n_t = _extrapolated_n(points, horizon_days)
+                joint_pred = fn(t_target, n_t)
+            else:
+                w_joint = 0.0
+        for i, tr in enumerate(trophies):
+            if i in per_trophy:
+                pts, fits, w, origin_rmse = per_trophy[i]
+                if equal_weights:
+                    med, _, _ = ensemble_predict(fits, t_target, None,
+                                                  equal=True)
+                else:
+                    med, _, _ = ensemble_predict(fits, t_target, w)
+                s = ensemble_spread(fits, pts, t_target, w, horizon_days,
+                                    pooled_sigma, origin_rmse)
+            else:
+                # No usable series: tier prior.
+                med = logit_pct(TIER_PRIOR.get(tr.get("tier"), 3.0))
+                s = 0.9
+            if joint_pred is not None:
+                med = (1.0 - w_joint) * med + w_joint * joint_pred[i]
+            rows.append((tr.get("id"), med, s))
+    out = []
+    for tid, m, s in rows:
         qs = []
+        prev = None
         for z in Z:
-            q = inv_logit(logit(median) + z * sigma)
-            qs.append(round4(min(99.99, max(0.01, q))))
-        for i in range(1, len(qs)):
-            if qs[i] < qs[i - 1]:
-                qs[i] = qs[i - 1]
-        rows.append({"id": trophy["id"], "q": qs})
-    return {"trophies": rows}
+            q = clamp_pct(inv_logit_pct(m + z * s))
+            q = round(q, 4)
+            if prev is not None and q < prev:
+                q = prev
+            qs.append(q)
+            prev = q
+        out.append({"id": tid, "q": qs})
+    return out
 
 
-def main():
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    for path in sorted(INPUT_DIR.glob("*.in")):
-        case = json.loads(path.read_text(encoding="utf-8"))
-        if case.get("levels") != LEVELS:
-            raise ValueError(f"{path.name} asks for levels {case.get('levels')}, not {LEVELS}")
-        forecast = forecast_case(case)
-        out = OUTPUT_DIR / f"{path.stem}.out"
-        out.write_text(json.dumps(forecast, separators=(",", ":")) + "\n",
-                       encoding="utf-8")
+def persistence_rows(case):
+    """Fallback forecast: last rate, house-baseline random-walk spread."""
+    trophies = case.get("trophies") or []
+    points, _, horizon_days, _ = refresh_points(case)
+    last = points[-1] if points else None
+    d = max(horizon_days, 0.0)
+    s = 0.5 * math.sqrt(d) if d > 0 else 0.1
+    out = []
+    for i, tr in enumerate(trophies):
+        r = None
+        if last and i < len(last["rates"]):
+            r = last["rates"][i]
+        if r is None:
+            r = TIER_PRIOR.get(tr.get("tier"), 3.0)
+        m = logit_pct(r)
+        qs = []
+        prev = None
+        for z in Z:
+            q = round(clamp_pct(inv_logit_pct(m + z * s)), 4)
+            if prev is not None and q < prev:
+                q = prev
+            qs.append(q)
+            prev = q
+        out.append({"id": tr.get("id"), "q": qs})
+    return out
+
+
+def main(argv=None):
+    in_dir = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
+    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
+    os.makedirs(out_dir, exist_ok=True)
+    paths = sorted(glob.glob(os.path.join(in_dir, "*.in")))
+    for path in paths:
+        name = os.path.splitext(os.path.basename(path))[0]
+        out_path = os.path.join(out_dir, name + ".out")
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                case = json.load(fh)
+            rows = forecast_case(case)
+        except Exception:
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    case = json.load(fh)
+                rows = persistence_rows(case)
+            except Exception:
+                rows = []
+        with open(out_path, "w", encoding="utf-8") as fh:
+            json.dump({"trophies": rows}, fh)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
